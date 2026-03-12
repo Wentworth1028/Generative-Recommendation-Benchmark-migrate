@@ -17,3 +17,8 @@
 /auto_hyper/
 /data/
 /backed/
+
+.vscode/
+# poetry
+poetry.lock
+pyproject.toml
