@@ -1,8 +1,6 @@
-
 from datetime import datetime
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
-from genrec.utils.factory import get_pipeline_class
 from genrec.utils.nni_utils import get_nni_params, update_config_with_nni
 from genrec.utils.common_utils import set_seed
 from genrec.utils.logging_utils import setup_logging
@@ -10,16 +8,19 @@ from genrec.utils.logging_utils import setup_logging
 import hydra
 import os
 
+from genrec.quantization.pipelines.rqkmeans_pipeline import RQKmeansPipeline
+
+from genrec.utils.factory import get_pipeline_class
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
- 
 def setup_output_directories(base_output_dir: str = "./output"):
     if "NNI_PLATFORM" in os.environ:
         nni_output_dir = os.environ["NNI_OUTPUT_DIR"]
         dirs = {
             'base': base_output_dir,
-            'tokenizer': os.path.join(base_output_dir,      os.environ["NNI_EXP_ID"], os.environ["NNI_TRIAL_JOB_ID"],'tokenizer_model'),
-            'checkpoints': os.path.join(base_output_dir,    os.environ["NNI_EXP_ID"], os.environ["NNI_TRIAL_JOB_ID"], 'checkpoints'),
+            'tokenizer': os.path.join(base_output_dir, os.environ["NNI_EXP_ID"], os.environ["NNI_TRIAL_JOB_ID"],'tokenizer_model'),
+            'checkpoints': os.path.join(base_output_dir, os.environ["NNI_EXP_ID"], os.environ["NNI_TRIAL_JOB_ID"], 'checkpoints'),
             'logs': os.path.join(nni_output_dir, 'logs')
         } 
     else:
@@ -35,36 +36,28 @@ def setup_output_directories(base_output_dir: str = "./output"):
     
     return dirs
 
-def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, gen_type: str,force_retrain: bool = False, accelerator=None):
+def stage1_train_tokenizer(tokenizer_config: dict, output_dirs: dict, gen_type: str, force_retrain: bool = False, accelerator=None):
     print("\n" + "="*60)
-    print("RQ-VAE Tokenizer")
+    print("RQ-KMeans Tokenizer") 
     print("="*60)
     
-    tokenizer_checkpoint = rqvae_config['checkpoint_path']
-    item2tokens_path = rqvae_config['save_path']
+    item2tokens_path = tokenizer_config['save_path']
     
-    if not force_retrain and os.path.exists(tokenizer_checkpoint) and os.path.exists(item2tokens_path):
-        print(f"exist tokenizer checkpoint: {tokenizer_checkpoint}")
-        print("skip tokenizer training...")
+    if not force_retrain and os.path.exists(item2tokens_path):
+        print(f"Exist tokenizer mapping: {item2tokens_path}")
+        print("Skip tokenizer generation (JSON already exists)...")
         return True
     
-    required_files = [rqvae_config['data_text_files'], rqvae_config['interaction_files']]
+    required_files = [tokenizer_config['data_text_files'], tokenizer_config['interaction_files']]
     for file_path in required_files:
         if not os.path.exists(file_path):
-            print(f"not exist: {file_path}")
+            print(f"Not exist: {file_path}")
             return False
     
-    try:
-        PipelineClass = get_pipeline_class(gen_type)
-        pipeline = PipelineClass(rqvae_config, accelerator=accelerator)
-        pipeline.run()
-        return True
-    except Exception as e:
-        print(f"RQ-VAE tokenizer train false: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
-
+    pipeline = RQKmeansPipeline(tokenizer_config, accelerator=accelerator)
+        
+    pipeline.run()
+    return True
 
 @hydra.main(version_base=None, config_path="config", config_name="quantization")
 def main(cfg: DictConfig):
@@ -92,29 +85,32 @@ def main(cfg: DictConfig):
     
     success = True
     
-    rqvae_config = OmegaConf.to_container(cfg.tokenizer, resolve=True)
-    rqvae_config['device'] = device
-    rqvae_config['tokenizer_path'] = os.path.join(output_dirs['tokenizer'], 'tokenizer.pkl')
-    rqvae_config['save_path'] = os.path.join(output_dirs['tokenizer'], 'item2tokens.json')
-    rqvae_config['checkpoint_path'] = os.path.join(output_dirs['tokenizer'], 'tokenizer_checkpoint.pth')
-    # get type
+    tokenizer_config = OmegaConf.to_container(cfg.tokenizer, resolve=True)
+    tokenizer_config['device'] = device
+    tokenizer_config['tokenizer_path'] = os.path.join(output_dirs['tokenizer'], 'tokenizer.pkl')
+    tokenizer_config['save_path'] = os.path.join(output_dirs['tokenizer'], 'item2tokens.json')
+    
+    tokenizer_config['checkpoint_path'] = None 
+    
     gen_type = cfg.type
-    # if accelerator.is_main_process:
+    
     tokenizer_success = stage1_train_tokenizer(
-        rqvae_config, output_dirs, gen_type=gen_type ,force_retrain=cfg.force_retrain_tokenizer, accelerator=accelerator
+        tokenizer_config, output_dirs, gen_type=gen_type, force_retrain=cfg.force_retrain_tokenizer, accelerator=accelerator
     )
+    
     if not tokenizer_success:
         if accelerator.is_main_process:
-            logger.info("Tokenizer train error")
+            logger.info("Tokenizer generation error")
         return
+        
     success = success and tokenizer_success
     accelerator.wait_for_everyone() 
     
     if accelerator.is_main_process:
         logger.info("\n" + "="*60)
         if success:
-            logger.info("Finish Train!")
-            logger.info(f"checkpoint : {output_dirs['base']}")
+            logger.info("Finish Generation!")
+            logger.info(f"Mapping saved at : {output_dirs['base']}")
         else:
             logger.info("Error")
         logger.info(f"Finish Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

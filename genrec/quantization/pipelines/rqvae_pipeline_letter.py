@@ -31,7 +31,7 @@ class LETTERRQVAETrainingPipeline:
     4. Model training
     5. Finalization and verification of the Tokenizer
     """
-    def __init__(self, config):
+    def __init__(self, config, accelerator=None):
         """
         Initializes the pipeline.
         
@@ -40,7 +40,7 @@ class LETTERRQVAETrainingPipeline:
                            It must include valid data and output paths.
         """
         self.config = config
-        
+        self.accelerator = accelerator
         self.tokenizer = None
         self.optimizer = None
         self.trainer = None
@@ -58,16 +58,36 @@ class LETTERRQVAETrainingPipeline:
         for path_key in required_paths:
             if not self.config.get(path_key):
                 raise ValueError(f"Configuration error: '{path_key}' must be specified in the config.")
-
-        dataset, dataloader = create_item_dataloader(
-            data_text_files=self.config['data_text_files'],
-            config=self.config,
-            batch_size=self.config['batch_size'],
-            text_encoder_model=self.config["text_encoder_model"],
-            embedding_strategy=self.config.get("embedding_strategy", "mean_pooling")
-        )
+        global_batch_size = self.config['batch_size']
+        if self.accelerator is not None:
+            num_processes = self.accelerator.num_processes
+            per_device_batch_size = max(1, global_batch_size // num_processes)
+            
+            if self.accelerator.is_main_process and global_batch_size % num_processes != 0:
+                print(f"Warning: Global batch size {global_batch_size} is not perfectly divisible by {num_processes} GPUs. "
+                      f"Using per-device batch size of {per_device_batch_size} (Actual global will be {per_device_batch_size * num_processes}).")
+        else:
+            per_device_batch_size = global_batch_size
+        if self.accelerator is not None:
+            with self.accelerator.main_process_first():
+                dataset, train_dataloader, valid_dataloader = create_item_dataloader(
+                    data_text_files=self.config['data_text_files'],
+                    config=self.config,
+                    batch_size=per_device_batch_size,
+                    text_encoder_model=self.config["text_encoder_model"],
+                    embedding_strategy=self.config.get("embedding_strategy", "mean_pooling"),
+                )
+        else:
+            dataset, train_dataloader, valid_dataloader = create_item_dataloader(
+                data_text_files=self.config['data_text_files'],
+                config=self.config,
+                batch_size=per_device_batch_size,
+                text_encoder_model=self.config["text_encoder_model"],
+                embedding_strategy=self.config.get("embedding_strategy", "mean_pooling"),
+            )
         self.dataset = dataset
-        self.train_dataloader = DataloaderWrapper(dataloader)
+        self.train_dataloader = DataloaderWrapper(train_dataloader)
+        self.valid_dataloader = DataloaderWrapper(valid_dataloader)
         print("Dataset and Dataloader created successfully.")
 
         print("\n--- Running a definitive data check ---")
@@ -86,21 +106,25 @@ class LETTERRQVAETrainingPipeline:
         print("\n--- Initializing Model, Optimizer, and Trainer ---")
         self.tokenizer = LETTERRQVAETokenizer(self.config)
         self.optimizer = LETTERRQVAETokenizerOptimizer(self.config, self.tokenizer)
-        self.trainer = LETTERRQVAETrainer(self.config, self.tokenizer, self.optimizer)
+        self.trainer = LETTERRQVAETrainer(self.config, self.tokenizer, self.optimizer, accelerator=self.accelerator)
         print("Initialization complete.")
 
     def _initialize_codebooks(self):
-        """Initializes the RQ-VAE codebooks using K-Means."""
-        print("\n--- Initializing RQ-VAE codebooks with K-Means ---")
-        all_embeddings = np.vstack([self.dataset.item_embeddings[item_id] for item_id in self.dataset.item_ids])
-        print(f"Total embeddings shape for K-Means: {all_embeddings.shape}")
-        self.tokenizer.initialize_rqvae(all_embeddings)
-        print("Codebook initialization complete.")
+        """Initializes the RQ-VAE codebooks using K-Means (Main Process Only)."""
+        if self.accelerator is None or self.accelerator.is_main_process:
+            print("\n--- Initializing RQ-VAE codebooks with K-Means ---")
+            all_embeddings = np.vstack([self.dataset.item_embeddings[item_id] for item_id in self.dataset.item_ids])
+            print(f"Total embeddings shape for K-Means: {all_embeddings.shape}")
+            self.tokenizer.initialize_rqvae(all_embeddings)
+            print("Codebook initialization complete.")
+            
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
     def _train(self):
         """Executes the training loop."""
         print("\n--- Starting Tokenizer Training ---")
-        self.trainer.fit(self.train_dataloader)
+        self.trainer.fit(self.train_dataloader,self.valid_dataloader)
         print("Training finished.")
 
     def _finalize_and_verify(self):
@@ -195,7 +219,5 @@ class LETTERRQVAETrainingPipeline:
         # self._initialize_codebooks()
         # self._train()
         self._finalize_and_verify()
-        tokenizer_save_path = self.config['tokenizer_path']
-        self.tokenizer.save(tokenizer_save_path)
         
         print("\n--- RQ-VAE Training Pipeline Finished Successfully ---")

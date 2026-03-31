@@ -1,29 +1,15 @@
 import os
-import math
 import json
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from tqdm import tqdm
-from .Quant.rqvae import RQVAE
-from collections import defaultdict 
-from .base_tokenizer import AbstractTokenizer
-import logging
 import hashlib
-import pickle
+import logging
+from collections import defaultdict
+from sklearn.cluster import KMeans
 
-class RQVAETokenizer(AbstractTokenizer, nn.Module):
-    """
-    Workflow:
-    1. Initialize TigerTokenizer: This creates the underlying RQ-VAE model.
-    2. Train the model: Use an TigerTrainer to train the TigerTokenizer instance.
-    3. Finalize: After training, call `finalize_tokenization()` to encode all items
-       and build the item-to-token mapping.
-    4. Tokenize: Now the tokenizer is ready to be used with `_tokenize_item_seq`.
-    """
+from .base_tokenizer import AbstractTokenizer
+
+class RQKmeansTokenizer(AbstractTokenizer):
     def __init__(self, config: dict):
-        nn.Module.__init__(self)
         AbstractTokenizer.__init__(self, config)
 
         self.item2tokens = {} 
@@ -34,47 +20,54 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
         self.eos_token = 1
         self.bos_token = self.pad_token
         self.ignored_label = -100
+        
         self.n_codebooks = self.config['n_codebooks']
-        # digits includes the codebooks plus an extra one for deduplication.
-        self.digits = self.n_codebooks + 1
-        self.dulicate_num = 0
         self.codebook_size = self.config['codebook_size']
+        self.digits = self.n_codebooks + 1 
+        self.dulicate_num = 0
+        
         self.num_user_tokens = 2000
         self.user_token_start_idx = None 
-        self.rq_vae = RQVAE(
-            in_dim=self.config['sent_emb_dim'],
-            num_emb_list=[self.codebook_size] * self.n_codebooks,
-            e_dim=self.config['rq_e_dim'],
-            layers=self.config['rq_layers'],
-            dropout_prob=self.config['dropout_prob'],
-            loss_type=self.config['loss_type'],
-            quant_loss_weight=self.config['quant_loss_weight'],
-            kmeans_init=self.config['rq_kmeans_init'],
-            kmeans_iters=self.config['kmeans_iters'],
-            commitment_beta=self.config['commitment_beta'],
-        )
+        
+        self.codebooks = []
+        
         self.save_path = self.config['save_path']
         self.user_save_path = self.config['save_path'].replace('.json', '_users.json')
         self.tokens2item_save_path = self.config['save_path'].replace('.json', '_tokens2item.json')
-    def forward(self, embeddings: torch.Tensor):
-        reconstructed_embeddings, quant_loss, indices, _ = self.rq_vae(embeddings)
-        return reconstructed_embeddings, indices, quant_loss
-    def initialize_rqvae(self, embeddings: np.ndarray):
-        self.log('[TOKENIZER] Initializing codebooks with K-Means...')
-        current_device = next(self.parameters()).device
-        embeddings_tensor = torch.from_numpy(embeddings).to(current_device)
-        self.rq_vae.vq_initialization(embeddings_tensor)
 
-    def encode(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Encodes embeddings into discrete codebook indices.
-        Args:
-            embeddings (torch.Tensor): A batch of embeddings.
-        Returns:
-            torch.Tensor: The codebook indices.
-        """
-        return self.rq_vae.get_indices(embeddings)
+    def log(self, message):
+        logging.info(message)
+        print(message)
 
+    def _encode_kmeans(self, embeddings: np.ndarray) -> np.ndarray:
+        N, D = embeddings.shape
+        residuals = embeddings.copy()
+        tokens = np.zeros((N, self.n_codebooks), dtype=int)
+
+        self.log(f'[TOKENIZER] Starting RQ-KMeans with {self.n_codebooks} levels, K={self.codebook_size}...')
+
+        for level in range(self.n_codebooks):
+            self.log(f'[TOKENIZER] Fitting K-Means for level {level + 1}/{self.n_codebooks}...')
+            
+            kmeans = KMeans(
+                n_clusters=self.codebook_size,
+                n_init='auto', 
+                random_state=42
+            )
+            
+            cluster_indices = kmeans.fit_predict(residuals)
+            tokens[:, level] = cluster_indices
+            
+            centers = kmeans.cluster_centers_
+            self.codebooks.append(centers)
+            
+            quantized_vectors = centers[cluster_indices]
+            residuals = residuals - quantized_vectors
+            
+            error = np.mean(np.linalg.norm(residuals, axis=1))
+            self.log(f'[TOKENIZER] Level {level + 1} finished. Mean L2 Error: {error:.4f}')
+
+        return tokens
 
     @classmethod
     def load(cls, config):
@@ -99,39 +92,27 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
 
         print(f"Tokenizer loaded successfully from JSON files based on config path: {tokenizer.save_path}")
         return tokenizer
+
     @property
     def vocab_size(self) -> int:
         return self.user_token_start_idx + self.num_user_tokens
 
-    def log(self, message):
-        logging.info(message)
-        print(message)
     def _hash_user_id(self, user_id: str) -> int:
         hash_object = hashlib.md5(str(user_id).encode())
         hash_int = int(hash_object.hexdigest(), 16)
         user_token_offset = hash_int % self.num_user_tokens
         return self.user_token_start_idx + user_token_offset
+
     def _adjust_semantic_ids_for_duplicates(self, item2sem_ids: dict) -> dict:
-        """
-        Ensures that each semantic ID sequence is unique by appending a counter.
-        Returns:
-            dict: 
-                - adjusted_item2sem_ids (dict): The new item-to-semantic-ID mapping.
-        """
         adjusted_item2sem_ids = {}
         sem_id_counts = defaultdict(int)
-
         sorted_item_ids = sorted(item2sem_ids.keys())
 
         for item_id in sorted_item_ids:
             sem_id_tuple = item2sem_ids[item_id]
-
             duplicate_counter = sem_id_counts[sem_id_tuple]
-
             adjusted_sem_id = sem_id_tuple + (duplicate_counter,)
-
             adjusted_item2sem_ids[item_id] = adjusted_sem_id
-
             sem_id_counts[sem_id_tuple] += 1
 
         max_count = max(sem_id_counts.values()) if sem_id_counts else 0
@@ -139,6 +120,17 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
         base_vocab_size = self.n_codebooks * self.codebook_size + self.reserve_tokens + self.dulicate_num
         self.user_token_start_idx = base_vocab_size
         return adjusted_item2sem_ids
+
+    def _sem_ids_to_tokens(self, item2sem_ids: dict) -> dict:
+        item2tokens = {}
+        for item, sem_ids in item2sem_ids.items():
+            tokens = list(sem_ids)
+            for i in range(self.digits):
+                offset = self.reserve_tokens + (self.codebook_size * i)
+                tokens[i] += offset
+            item2tokens[item] = tuple(tokens)
+        return item2tokens
+
     def finalize_tokenization(self, item_embeddings_data: tuple, user_ids: list = None):
         if os.path.exists(self.save_path):
             self.log(f'[TOKENIZER] Loading from {self.save_path}')
@@ -158,34 +150,31 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
                 min_user_token = min(self.user2tokens.values())
                 self.user_token_start_idx = min_user_token
             return
+            
         self.log(f'[TOKENIZER] Cache file not found. Starting full tokenization process...')
         item_ids, sent_embs = item_embeddings_data
         
         if len(item_ids) != sent_embs.shape[0]:
             raise ValueError("Number of item IDs does not match the number of embeddings.")
 
-        self.eval()
-        with torch.no_grad():
-            current_device = next(self.parameters()).device
-            all_embs_tensor = torch.from_numpy(sent_embs).to(current_device)
-            all_codes = self.encode(all_embs_tensor).cpu().numpy()
+        all_codes = self._encode_kmeans(sent_embs)
 
         item2sem_ids = {}
         for i, item_id in enumerate(item_ids):
             item2sem_ids[item_id] = tuple(all_codes[i].tolist())
 
         adjusted_item2sem_ids = self._adjust_semantic_ids_for_duplicates(item2sem_ids)
-        
-
         self.item2tokens = self._sem_ids_to_tokens(adjusted_item2sem_ids)
         self.tokens2item = {v: k for k, v in self.item2tokens.items()}
         self.log(f'[TOKENIZER] Processing complete. Mapped {len(self.item2tokens)} items.')
+        
         if user_ids:
             unique_user_ids = list(set(user_ids))
             self.log(f'[TOKENIZER] Processing {len(unique_user_ids)} unique users...')
             for user_id in unique_user_ids:
                 self.user2tokens[user_id] = self._hash_user_id(user_id)
             self.log(f'[TOKENIZER] Processing complete. Mapped {len(self.user2tokens)} users.')
+            
         is_main_process = os.environ.get("LOCAL_RANK", "0") == "0"
         if is_main_process:
             with open(self.save_path, 'w', encoding='utf-8') as f:
@@ -195,15 +184,7 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
                 json.dump(str_keys_tokens2item, f, ensure_ascii=False, indent=4)
             with open(self.user_save_path, 'w', encoding='utf-8') as f:
                 json.dump(self.user2tokens, f, ensure_ascii=False, indent=4)
-    def _sem_ids_to_tokens(self, item2sem_ids: dict) -> dict:
-        item2tokens = {}
-        for item, sem_ids in item2sem_ids.items():
-            tokens = list(sem_ids)
-            for i in range(self.digits):
-                offset = self.reserve_tokens + (self.codebook_size * i)
-                tokens[i] += offset
-            item2tokens[item] = tuple(tokens)
-        return item2tokens
+
     def _tokenize_item_seq(self, item_seq: list, max_item_len: int, user_id: str = None) -> list:
         if not self.item2tokens:
             raise RuntimeError("Tokenizer has not been finalized. Please run `finalize_tokenization` after training.")
@@ -222,10 +203,11 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
             token_seq = [user_token] + token_seq
         token_seq.append(self.eos_token)
         return token_seq
+
     def tokens_to_item(self, tokens: tuple) -> int:
-        """Converts a tuple of tokens back to its original item ID."""
         if not self.tokens2item:
             raise RuntimeError("Tokenizer has not been finalized. Please run `finalize_tokenization`.")
         return self.tokens2item.get(tokens)
+
     def get_user_token(self, user_id: str) -> int:
         return self.user2tokens[user_id]

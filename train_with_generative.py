@@ -45,16 +45,15 @@ def setup_output_directories(base_output_dir: str = "./output"):
 
     return dirs
 
-
-def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, force_retrain: bool = False):
-    print("\n" + "=" * 60)
+def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, gen_type: str,force_retrain: bool = False, accelerator=None):
+    print("\n" + "="*60)
     print("RQ-VAE Tokenizer")
     print("=" * 60)
 
     tokenizer_checkpoint = rqvae_config['checkpoint_path']
     item2tokens_path = rqvae_config['save_path']
-
-    if not force_retrain and os.path.exists(tokenizer_checkpoint) and os.path.exists(item2tokens_path):
+    
+    if not force_retrain and os.path.exists(item2tokens_path):
         print(f"exist tokenizer checkpoint: {tokenizer_checkpoint}")
         print("skip tokenizer training...")
         return True
@@ -66,7 +65,8 @@ def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, force_retrain:
             return False
 
     try:
-        pipeline = RQVAETrainingPipeline(rqvae_config)
+        PipelineClass = get_pipeline_class(gen_type)
+        pipeline = PipelineClass(rqvae_config, accelerator=accelerator)
         pipeline.run()
         return True
     except Exception as e:
@@ -98,25 +98,20 @@ def stage2_train_generation_model(
         if accelerator.is_main_process:
             logger.info(f"Error: Not Found: {tokenizer_items2tokens_path}")
         return False
-
-    tokenizer_object_path = rqvae_config['tokenizer_path']
-    if not os.path.exists(tokenizer_object_path):
-        if accelerator.is_main_process:
-            logger.info(f"Error: Not Found: {tokenizer_object_path}")
-        return False
-
+    
     if accelerator.is_main_process:
-        logger.info("-" * 40)
-        logger.info("🚀 parameters:")
-        logger.info(f"   - Learning Rate: {model_config.get('learning_rate')}")
-        logger.info(f"   - Weight Decay:  {model_config.get('weight_decay')}")
-        logger.info(f"   - Batch Size:    {model_config.get('batch_size')}")
-        logger.info(f"   - Num Epochs:    {model_config.get('num_epochs')}")
-        logger.info(f"   - Seed:          {model_config.get('seed', 'N/A')}")
-        logger.info("-" * 40)
+            logger.info("-" * 40)
+            logger.info("🚀 parameters:")
+            logger.info(f"   - Learning Rate: {model_config.get('learning_rate')}")
+            logger.info(f"   - Weight Decay:  {model_config.get('weight_decay')}")
+            logger.info(f"   - Batch Size:    {model_config.get('batch_size')}")
+            logger.info(f"   - Num Epochs:    {model_config.get('num_epochs')}")
+            logger.info(f"   - Seed:          {model_config.get('seed')}")
+            logger.info(f"   - Inference:     {model_config.get('inference_mode')}")
+            logger.info("-" * 40)
     if accelerator.is_main_process:
-        logger.info(f"loading from {tokenizer_object_path}...")
-    tokenizer = RQVAETokenizer.load(tokenizer_object_path)
+        logger.info(f"loading Tokenizer...")
+    tokenizer = RQVAETokenizer.load(rqvae_config)
     if accelerator.is_main_process:
         logger.info(f"total {len(tokenizer.item2tokens)} item")
         logger.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
@@ -228,11 +223,12 @@ def stage2_train_generation_model(
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_eval_batch_size,
         train_data_collator=train_data_collator,
+        vocab_size=vocab_size
     )
-    if not do_inference_only:
-        trainer.train()
-        accelerator.wait_for_everyone()
-
+    model.config.use_cache = False
+    trainer.train()
+    accelerator.wait_for_everyone()
+    
     if accelerator.is_main_process:
         logger.info("predict test set...")
     test_results = trainer.predict(test_dataset)
@@ -293,14 +289,14 @@ def main(cfg: DictConfig):
     rqvae_config['checkpoint_path'] = os.path.join(output_dirs['tokenizer'], 'tokenizer_checkpoint.pth')
 
     if not cfg.skip_tokenizer:
-        if accelerator.is_main_process:
-            tokenizer_success = stage1_train_tokenizer(
-                rqvae_config, output_dirs, force_retrain=cfg.force_retrain_tokenizer
-            )
-            if not tokenizer_success:
+        tokenizer_success = stage1_train_tokenizer(
+            rqvae_config, output_dirs, gen_type=cfg.tokenizer_type ,force_retrain=cfg.force_retrain_tokenizer, accelerator=accelerator
+        )
+        if not tokenizer_success:
+            if accelerator.is_main_process:
                 logger.info("Tokenizer train error")
-                return
-            success = success and tokenizer_success
+            return
+        success = success and tokenizer_success
         accelerator.wait_for_everyone()
     elif accelerator.is_main_process:
         logger.info("skip tokenizer training")
@@ -313,6 +309,7 @@ def main(cfg: DictConfig):
         # model_config['model_save_path'] = os.path.join(output_dirs['model'], f"{cfg.dataset}_final_model.pt")
         model_config['model_save_path'] = output_dirs['model']
         model_config['checkpoint_dir'] = output_dirs['checkpoints']
+        model_config['seed'] = seed
 
         model_success = stage2_train_generation_model(
             model_config,
