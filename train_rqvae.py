@@ -46,6 +46,10 @@ def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, gen_type: str,
     if not force_retrain and os.path.exists(tokenizer_checkpoint) and os.path.exists(item2tokens_path):
         print(f"exist tokenizer checkpoint: {tokenizer_checkpoint}")
         print("skip tokenizer training...")
+        PipelineClass = get_pipeline_class(gen_type)
+        pipeline = PipelineClass(rqvae_config, accelerator=accelerator)
+        if hasattr(pipeline, "export_existing_popularity_token_csv"):
+            pipeline.export_existing_popularity_token_csv()
         return True
     
     required_files = [rqvae_config['data_text_files'], rqvae_config['interaction_files']]

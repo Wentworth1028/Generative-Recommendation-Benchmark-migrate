@@ -11,6 +11,8 @@ import numpy as np
 import pickle
 import os
 import time
+import argparse
+import random
 from tqdm import tqdm
 from dataclasses import dataclass
 from collections import defaultdict
@@ -22,6 +24,8 @@ from disrec.datasets.data_collator import SASRecDataCollator
 
 from transformers import TrainerCallback,EarlyStoppingCallback
 import numpy as np
+
+
 class EvaluateEveryNEpochsCallback(TrainerCallback):
     def __init__(self, n_epochs=5):
         self.n_epochs = n_epochs
@@ -111,22 +115,58 @@ def print_model_parameters(model: nn.Module):
     print(f"  - trainable_params:   {trainable_params:,}")
     print("-" * 50)
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train SASRec and export CF item embeddings.")
+    parser.add_argument("--data_file", type=str, default="./data/Beauty/user2item.pkl")
+    parser.add_argument("--output_dir", type=str, default="./sasrec")
+    parser.add_argument("--max_seq_len", type=int, default=20)
+    parser.add_argument("--embedding_dim", type=int, default=32)
+    parser.add_argument("--num_hidden_layers", type=int, default=2)
+    parser.add_argument("--num_attention_heads", type=int, default=2)
+    parser.add_argument("--hidden_dropout_prob", type=float, default=0.2)
+    parser.add_argument("--num_neg_samples", type=int, default=4)
+    parser.add_argument("--norm_emb", action="store_true")
+    parser.add_argument("--num_train_epochs", type=int, default=200)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1024)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=256)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--early_stopping_patience", type=int, default=100)
+    parser.add_argument("--eval_every_n_epochs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 if __name__ == "__main__":
-    REAL_DATA_FILE = "./data/Beauty/user2item.pkl" 
-    OUTPUT_DIR = "./sasrec"
-    MAX_SEQ_LEN = 20
-    EMBEDDING_DIM = 32
-    EVAL_EVERY_N_EPOCHS = 1
+    args = parse_args()
+    set_seed(args.seed)
+
+    REAL_DATA_FILE = args.data_file
+    OUTPUT_DIR = args.output_dir
+    MAX_SEQ_LEN = args.max_seq_len
+    EMBEDDING_DIM = args.embedding_dim
+    EVAL_EVERY_N_EPOCHS = args.eval_every_n_epochs
     VOCAB_SIZE = load_data_and_get_vocab_size(REAL_DATA_FILE)
     
     config = SASRecConfig(
         vocab_size=VOCAB_SIZE,
         max_seq_len=MAX_SEQ_LEN,
         hidden_size=EMBEDDING_DIM,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        hidden_dropout_prob=0.2,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        hidden_dropout_prob=args.hidden_dropout_prob,
         pad_token_id=0,
+        norm_emb=args.norm_emb,
+        num_neg_samples=args.num_neg_samples,
     )
     model = SASRec4HF(config)
     print_model_parameters(model)
@@ -148,9 +188,9 @@ if __name__ == "__main__":
     data_collator = SASRecDataCollator(pad_token_id=config.pad_token_id, max_seq_len=MAX_SEQ_LEN)
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=200, 
-        per_device_train_batch_size=1024,
-        per_device_eval_batch_size=256,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         logging_strategy="epoch",
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -158,13 +198,13 @@ if __name__ == "__main__":
         metric_for_best_model="NDCG@10", 
         greater_is_better=True,       
         report_to="none",
-        learning_rate=1e-3, 
+        learning_rate=args.learning_rate,
         ddp_find_unused_parameters=False,
-        weight_decay=0.01,
+        weight_decay=args.weight_decay,
         # warmup_steps=500, 
     )
     callbacks = [
-        EarlyStoppingCallback(early_stopping_patience=100), 
+        EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
         EvaluateEveryNEpochsCallback(n_epochs=EVAL_EVERY_N_EPOCHS)
     ]
 

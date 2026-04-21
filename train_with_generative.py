@@ -14,7 +14,7 @@ from genrec.data.collators.generative.tiger_collator import TigerDataCollator
 from genrec.utils.nni_utils import get_nni_params, update_config_with_nni
 from genrec.utils.common_utils import set_seed
 from genrec.utils.logging_utils import setup_logging
-from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class
+from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -45,14 +45,17 @@ def setup_output_directories(base_output_dir: str = "./output"):
 
     return dirs
 
-def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, gen_type: str,force_retrain: bool = False, accelerator=None):
-    print("\n" + "="*60)
+
+def stage1_train_tokenizer(
+    rqvae_config: dict, output_dirs: dict, gen_type: str, force_retrain: bool = False, accelerator=None
+):
+    print("\n" + "=" * 60)
     print("RQ-VAE Tokenizer")
     print("=" * 60)
 
     tokenizer_checkpoint = rqvae_config['checkpoint_path']
     item2tokens_path = rqvae_config['save_path']
-    
+
     if not force_retrain and os.path.exists(item2tokens_path):
         print(f"exist tokenizer checkpoint: {tokenizer_checkpoint}")
         print("skip tokenizer training...")
@@ -98,17 +101,17 @@ def stage2_train_generation_model(
         if accelerator.is_main_process:
             logger.info(f"Error: Not Found: {tokenizer_items2tokens_path}")
         return False
-    
+
     if accelerator.is_main_process:
-            logger.info("-" * 40)
-            logger.info("🚀 parameters:")
-            logger.info(f"   - Learning Rate: {model_config.get('learning_rate')}")
-            logger.info(f"   - Weight Decay:  {model_config.get('weight_decay')}")
-            logger.info(f"   - Batch Size:    {model_config.get('batch_size')}")
-            logger.info(f"   - Num Epochs:    {model_config.get('num_epochs')}")
-            logger.info(f"   - Seed:          {model_config.get('seed')}")
-            logger.info(f"   - Inference:     {model_config.get('inference_mode')}")
-            logger.info("-" * 40)
+        logger.info("-" * 40)
+        logger.info("🚀 parameters:")
+        logger.info(f"   - Learning Rate: {model_config.get('learning_rate')}")
+        logger.info(f"   - Weight Decay:  {model_config.get('weight_decay')}")
+        logger.info(f"   - Batch Size:    {model_config.get('batch_size')}")
+        logger.info(f"   - Num Epochs:    {model_config.get('num_epochs')}")
+        logger.info(f"   - Seed:          {model_config.get('seed')}")
+        logger.info(f"   - Inference:     {model_config.get('inference_mode')}")
+        logger.info("-" * 40)
     if accelerator.is_main_process:
         logger.info(f"loading Tokenizer...")
     tokenizer = RQVAETokenizer.load(rqvae_config)
@@ -223,12 +226,12 @@ def stage2_train_generation_model(
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=per_device_eval_batch_size,
         train_data_collator=train_data_collator,
-        vocab_size=vocab_size
+        vocab_size=vocab_size,
     )
     model.config.use_cache = False
     trainer.train()
     accelerator.wait_for_everyone()
-    
+
     if accelerator.is_main_process:
         logger.info("predict test set...")
     test_results = trainer.predict(test_dataset)
@@ -290,7 +293,11 @@ def main(cfg: DictConfig):
 
     if not cfg.skip_tokenizer:
         tokenizer_success = stage1_train_tokenizer(
-            rqvae_config, output_dirs, gen_type=cfg.tokenizer_type ,force_retrain=cfg.force_retrain_tokenizer, accelerator=accelerator
+            rqvae_config,
+            output_dirs,
+            gen_type=cfg.tokenizer_type,
+            force_retrain=cfg.force_retrain_tokenizer,
+            accelerator=accelerator,
         )
         if not tokenizer_success:
             if accelerator.is_main_process:

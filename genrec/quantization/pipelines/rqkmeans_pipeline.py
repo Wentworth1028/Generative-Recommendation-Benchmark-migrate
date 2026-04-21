@@ -1,6 +1,9 @@
 import os
+import csv
+import json
 import numpy as np
 import pickle
+from collections import Counter
 
 from genrec.quantization.tokenizers.rqkmeans_tokenizer import RQKmeansTokenizer
 from genrec.quantization.data.dataset.rqvae_dataset import create_item_dataloader
@@ -11,6 +14,55 @@ class RQKmeansPipeline:
         self.accelerator = accelerator
         self.tokenizer = None
         self.dataset = None
+        self.item_popularity = {}
+
+    def _is_main_process(self):
+        return self.accelerator is None or self.accelerator.is_main_process
+
+    def _compute_item_popularity(self):
+        interaction_path = self.config['interaction_files']
+        with open(interaction_path, 'rb') as f:
+            user2item_data = pickle.load(f)
+
+        counter = Counter()
+        for _, row in user2item_data.iterrows():
+            item_seq = row['ItemID']
+            counter.update(int(item_id) for item_id in item_seq)
+
+        if self._is_main_process():
+            print(f"Computed popularity for {len(counter)} items from: {interaction_path}")
+        return dict(counter)
+
+    def _ensure_tokenizer_loaded_from_json(self):
+        if self.tokenizer is None or not self.tokenizer.item2tokens:
+            self.tokenizer = RQKmeansTokenizer.load(self.config)
+        return self.tokenizer
+
+    def _export_item_popularity_tokens_csv(self):
+        if not self._is_main_process():
+            return
+
+        tokenizer = self._ensure_tokenizer_loaded_from_json()
+        output_path = self.config['save_path'].replace('.json', '_item_popularity_tokens.csv')
+        all_item_ids = sorted(set(self.item_popularity.keys()) | set(tokenizer.item2tokens.keys()))
+
+        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["item_id", "popularity", "token_ids"])
+            for item_id in all_item_ids:
+                token_ids = tokenizer.item2tokens.get(item_id, [])
+                writer.writerow([
+                    int(item_id),
+                    int(self.item_popularity.get(item_id, 0)),
+                    json.dumps([int(token_id) for token_id in token_ids], ensure_ascii=False),
+                ])
+
+        print(f"Saved item-popularity-token CSV to: {output_path}")
+
+    def export_existing_popularity_token_csv(self):
+        self.item_popularity = self._compute_item_popularity()
+        self._ensure_tokenizer_loaded_from_json()
+        self._export_item_popularity_tokens_csv()
 
     def _prepare_data(self):
         print("\n--- Creating Dataset ---")
@@ -55,6 +107,7 @@ class RQKmeansPipeline:
             
             print("\n--- [Main Process] Running RQ-KMeans (on CPU) & Saving JSON ---")
             self.tokenizer.finalize_tokenization((item_ids_list, embeddings_array), all_user_ids)
+            self._export_item_popularity_tokens_csv()
         else:
             print(f"\n--- [Worker Process] Waiting for Main Process to finish KMeans ---")
 
@@ -64,7 +117,8 @@ class RQKmeansPipeline:
     def run(self):
         if self.accelerator is None or self.accelerator.is_main_process:
             print(f"=== Starting RQ-KMeans Training Pipeline ===")
-        
+
+        self.item_popularity = self._compute_item_popularity()
         self._prepare_data()
         
         self._run_kmeans_and_finalize()
