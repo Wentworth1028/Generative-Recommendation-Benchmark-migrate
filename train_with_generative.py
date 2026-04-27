@@ -2,6 +2,7 @@
 
 import os
 import torch
+import json
 from torch.utils.data import DataLoader
 from datetime import datetime
 from accelerate import Accelerator
@@ -16,6 +17,7 @@ from genrec.utils.common_utils import set_seed
 from genrec.utils.logging_utils import setup_logging
 from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
+from genrec.utils.popularity_metrics import compute_prediction_popularity_metrics, compute_train_item_popularity
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -237,8 +239,41 @@ def stage2_train_generation_model(
     test_results = trainer.predict(test_dataset)
     if accelerator.is_main_process:
         metrics = test_results.metrics
+        predictions_tensor = torch.from_numpy(test_results.predictions)
+        batch_size = predictions_tensor.shape[0]
+        num_beams = predictions_tensor.shape[1]
+        generated_ids_reshaped = predictions_tensor.view(batch_size, num_beams, -1)[:, :, 1:]
+        tiger_predictions = []
+        for user_sequences in generated_ids_reshaped:
+            seen = set()
+            item_ids = []
+            for seq in user_sequences:
+                tokens_tuple = tuple(seq.tolist())
+                item_id = tokenizer.tokens2item.get(tokens_tuple, None)
+                if item_id is None or item_id in seen:
+                    continue
+                seen.add(item_id)
+                item_ids.append(int(item_id))
+            tiger_predictions.append(item_ids)
 
-        k_values = sorted(list(set(int(key.split('@')[-1]) for key in metrics.keys() if '@' in key)))
+        train_item_popularity = compute_train_item_popularity(model_config['data_interaction_files'], shift_item_id=0)
+        popularity_metrics = compute_prediction_popularity_metrics(
+            tiger_predictions,
+            train_item_popularity,
+            k_list=model_config.get("k_list", [1, 5, 10]),
+            quantiles=(0.1, 0.2),
+        )
+        metrics.update({f"test_{key}": value for key, value in popularity_metrics.items()})
+
+        k_values = sorted(
+            list(
+                set(
+                    int(key.split("@")[-1])
+                    for key in metrics.keys()
+                    if key.startswith("test_hit@") or key.startswith("test_ndcg@")
+                )
+            )
+        )
 
         logger.info("=" * 30 + " test results " + "=" * 30)
 
@@ -247,8 +282,45 @@ def stage2_train_generation_model(
             ndcg_val = metrics.get(f"test_ndcg@{k}", 0.0)
 
             logger.info(f"Hit@{k}: {hit_val:.4f}, NDCG@{k}: {ndcg_val:.4f}")
+        for key, value in popularity_metrics.items():
+            logger.info(f"{key}: {value:.4f}")
 
         logger.info("=" * 75)
+        final_metrics = {
+            "model": gen_type,
+            "dataset": model_config.get("dataset_name"),
+            "output_dir": os.path.abspath(output_dirs['base']),
+            "model_dir": os.path.abspath(output_dirs['model']),
+            "tokenizer_dir": os.path.abspath(output_dirs['tokenizer']),
+            "best_checkpoint": trainer.state.best_model_checkpoint,
+            "best_metric": trainer.state.best_metric,
+            "inference_mode": model_config.get("inference_mode"),
+            "metrics": {key: float(value) for key, value in metrics.items()},
+            "popularity_metrics": {key: float(value) for key, value in popularity_metrics.items()},
+            "config": {
+                "learning_rate": model_config.get("learning_rate"),
+                "weight_decay": model_config.get("weight_decay"),
+                "batch_size": model_config.get("batch_size"),
+                "test_batch_size": model_config.get("test_batch_size"),
+                "num_epochs": model_config.get("num_epochs"),
+                "num_beams": model_config.get("num_beams"),
+                "max_gen_length": model_config.get("max_gen_length"),
+                "k_list": model_config.get("k_list"),
+                "seed": model_config.get("seed"),
+                "d_model": model_config.get("d_model"),
+                "d_kv": model_config.get("d_kv"),
+                "d_ff": model_config.get("d_ff"),
+                "num_layers": model_config.get("num_layers"),
+                "num_decoder_layers": model_config.get("num_decoder_layers"),
+                "num_heads": model_config.get("num_heads"),
+                "dropout_rate": model_config.get("dropout_rate"),
+                "tie_word_embeddings": model_config.get("tie_word_embeddings"),
+            },
+        }
+        final_metrics_path = os.path.join(output_dirs['base'], "final_metrics.json")
+        with open(final_metrics_path, "w", encoding="utf-8") as f:
+            json.dump(final_metrics, f, ensure_ascii=False, indent=2)
+        logger.info(f"Final metrics saved to: {final_metrics_path}")
 
     if (not do_inference_only) and ("NNI_PLATFORM" not in os.environ):
         trainer.save_model(output_dirs['model'])

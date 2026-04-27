@@ -13,6 +13,7 @@ import os
 import time
 import argparse
 import random
+import json
 from tqdm import tqdm
 from dataclasses import dataclass
 from collections import defaultdict
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from disrec.sasrec.sasrec4hf import SASRecConfig,SASRec4HF
 from disrec.datasets.model_dataset import SASRecDataset
 from disrec.datasets.data_collator import SASRecDataCollator
+from genrec.utils.popularity_metrics import compute_prediction_popularity_metrics, compute_train_item_popularity
 
 from transformers import TrainerCallback,EarlyStoppingCallback
 import numpy as np
@@ -134,6 +136,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--early_stopping_patience", type=int, default=100)
     parser.add_argument("--eval_every_n_epochs", type=int, default=1)
+    parser.add_argument("--save_total_limit", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -194,6 +197,7 @@ if __name__ == "__main__":
         logging_strategy="epoch",
         eval_strategy="epoch",
         save_strategy="epoch",
+        save_total_limit=args.save_total_limit,
         load_best_model_at_end=True,
         metric_for_best_model="NDCG@10", 
         greater_is_better=True,       
@@ -223,9 +227,64 @@ if __name__ == "__main__":
     trainer.train()
 
     print("--- Test Set Evaluation ---")
-    test_results = trainer.evaluate(eval_dataset=test_dataset) 
+    test_predictions = trainer.predict(test_dataset)
+    test_results = test_predictions.metrics
     test_results_renamed = {f"test_{k}": v for k, v in test_results.items()}
+    sasrec_predictions = []
+    for row in test_predictions.predictions:
+        seen = set()
+        items = []
+        for item_id in row.tolist():
+            raw_item_id = int(item_id) - 1
+            if raw_item_id < 0 or raw_item_id in seen:
+                continue
+            seen.add(raw_item_id)
+            items.append(raw_item_id)
+        sasrec_predictions.append(items)
+    train_item_popularity = compute_train_item_popularity(REAL_DATA_FILE, shift_item_id=0)
+    popularity_metrics = compute_prediction_popularity_metrics(
+        sasrec_predictions,
+        train_item_popularity,
+        k_list=(1, 5, 10),
+        quantiles=(0.1, 0.2),
+    )
+    test_results_renamed.update({f"test_{key}": value for key, value in popularity_metrics.items()})
     print("Result:", test_results_renamed)
+    best_model_dir = os.path.join(OUTPUT_DIR, "best_model")
+    trainer.save_model(best_model_dir)
+    final_metrics = {
+        "model": "sasrec",
+        "data_file": os.path.abspath(REAL_DATA_FILE),
+        "output_dir": os.path.abspath(OUTPUT_DIR),
+        "best_checkpoint": trainer.state.best_model_checkpoint,
+        "best_model_dir": os.path.abspath(best_model_dir),
+        "best_metric": trainer.state.best_metric,
+        "metrics": test_results_renamed,
+        "popularity_metrics": popularity_metrics,
+        "config": {
+            "max_seq_len": args.max_seq_len,
+            "embedding_dim": args.embedding_dim,
+            "num_hidden_layers": args.num_hidden_layers,
+            "num_attention_heads": args.num_attention_heads,
+            "hidden_dropout_prob": args.hidden_dropout_prob,
+            "num_neg_samples": args.num_neg_samples,
+            "norm_emb": args.norm_emb,
+            "num_train_epochs": args.num_train_epochs,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "per_device_eval_batch_size": args.per_device_eval_batch_size,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "early_stopping_patience": args.early_stopping_patience,
+            "eval_every_n_epochs": args.eval_every_n_epochs,
+            "save_total_limit": args.save_total_limit,
+            "seed": args.seed,
+        },
+    }
+    final_metrics_path = os.path.join(OUTPUT_DIR, "final_metrics.json")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(final_metrics_path, "w", encoding="utf-8") as f:
+        json.dump(final_metrics, f, ensure_ascii=False, indent=2)
+    print(f"save final metrics to: {final_metrics_path}")
 
     print("--- Inducing CF Embedding ---")
     
