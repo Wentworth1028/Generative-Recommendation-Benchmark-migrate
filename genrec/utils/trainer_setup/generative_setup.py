@@ -10,8 +10,9 @@ from genrec.utils.metrics import compute_metrics
 from genrec.utils.callbacks.generative.generative_callback import (
     GenerativeLoggingCallback,
     EvaluateEveryNEpochsCallback,
-    DelayedEvaluateEveryNEpochsCallback
+    DelayedEvaluateEveryNEpochsCallback,
 )
+
 
 def setup_training(
     model,
@@ -25,9 +26,9 @@ def setup_training(
     per_device_train_batch_size,
     per_device_eval_batch_size,
     train_data_collator,
-    vocab_size: Optional[int] = None
+    vocab_size: Optional[int] = None,
 ):
-    
+
     training_args = TrainingArguments(
         output_dir=output_dirs['model'],
         num_train_epochs=model_config['num_epochs'],
@@ -47,37 +48,30 @@ def setup_training(
         remove_unused_columns=False,
         metric_for_best_model="ndcg@10",
         greater_is_better=True,
+        seed=model_config.get("seed", 42),
+        data_seed=model_config.get("seed", 42),
     )
-    
+
     tokens_to_item_map = tokenizer.tokens2item
-    compute_metrics_with_map = partial(
-        compute_metrics,
-        tokens_to_item_map=tokens_to_item_map
-    )
-    
+    compute_metrics_with_map = partial(compute_metrics, tokens_to_item_map=tokens_to_item_map)
+
     num_beams = model_config.get('num_beams', 10)
     max_gen_length = model_config.get('max_gen_length', 5)
     k_list = model_config.get('k_list', [5, 10, 20])
     max_k = k_list[-1] if k_list else 10
-    
-    generation_params = {
-        'max_gen_length': max_gen_length,
-        'num_beams': num_beams,
-        'max_k': max_k
-    }
-    
+
+    generation_params = {'max_gen_length': max_gen_length, 'num_beams': num_beams, 'max_k': max_k}
+
     # ===== CallBacks =====
     callbacks = [
-        EarlyStoppingCallback(
-            early_stopping_patience=model_config.get("early_stop_upper_steps", 1000)
-        ),
+        EarlyStoppingCallback(early_stopping_patience=model_config.get("early_stop_upper_steps", 1000)),
         GenerativeLoggingCallback(logger),
         # start_epoch means when to start evaluate
-        DelayedEvaluateEveryNEpochsCallback(n_epochs=model_config.get("evaluation_epoch", 5), start_epoch=0)
+        DelayedEvaluateEveryNEpochsCallback(n_epochs=model_config.get("evaluation_epoch", 5), start_epoch=0),
     ]
-    
+
     trainer_partial = instantiate(generative_config.trainer)
-    
+
     trainer = trainer_partial(
         model=model,
         args=training_args,
@@ -91,7 +85,7 @@ def setup_training(
         pad_token_id=tokenizer.pad_token,
         eos_token_id=tokenizer.eos_token,
         vocab_size=vocab_size,
-        inference_mode=model_config["inference_mode"]
+        inference_mode=model_config["inference_mode"],
     )
-    
+
     return trainer
