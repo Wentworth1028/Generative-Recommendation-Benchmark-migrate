@@ -10,6 +10,10 @@ rq_layers: [512, 256, 128]
 dropout_prob: 0
 loss_type: "mse"
 quant_loss_weight: 0.25
+popularity_balance_weight: 0.0
+popularity_softmax_temperature: 1.0
+popularity_weight_transform: "log1p"
+popularity_balance_eps: 1e-8
 commitment_beta: 0.25
 rq_kmeans_init: true
 kmeans_iters: 10

@@ -24,6 +24,8 @@ class RQVAETrainer:
         self.log_interval = self.config.get('log_interval')
         self.checkpoint_path = self.config.get('checkpoint_path')
         self.save_interval = self.config.get('save_interval')
+        self.item_popularity = self.config.get('item_popularity', {})
+        self.popularity_balance_weight = float(self.config.get('popularity_balance_weight', 0.0))
 
         self.save_best_on = self.config.get('save_best_on', 'collision_rate').lower()
         if self.save_best_on not in ['utilization', 'collision_rate']:
@@ -38,6 +40,14 @@ class RQVAETrainer:
             logging.info(f"The best model will be saved based on the best value of '{self.save_best_on}'.")
         # self.tokenizer.to(self.device)
         # self.optimizer.move_optimizer_state_to_device(self.device)
+
+    def _batch_popularity_weights(self, item_ids):
+        if self.popularity_balance_weight <= 0.0:
+            return None
+        if torch.is_tensor(item_ids):
+            item_ids = item_ids.detach().cpu().tolist()
+        weights = [float(self.item_popularity.get(int(item_id), 0.0)) for item_id in item_ids]
+        return torch.tensor(weights, dtype=torch.float32, device=self.device)
 
     def _calculate_codebook_utilization(self, train_dataloader, log_output=True):
         self.tokenizer.eval()
@@ -109,21 +119,37 @@ class RQVAETrainer:
 
     def _train_one_epoch(self, train_dataloader, epoch: int):
         self.tokenizer.train()
-        total_loss, total_recon_loss, total_commit_loss = 0.0, 0.0, 0.0
+        total_loss, total_recon_loss, total_commit_loss, total_popularity_balance_loss = 0.0, 0.0, 0.0, 0.0
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{self.epochs} [Training]", leave=False)
-        for _, embeddings in progress_bar:
+        for item_ids, embeddings in progress_bar:
             embeddings = embeddings.to(self.device)
             self.optimizer.zero_grad()
             tokenizer_output = self.tokenizer(embeddings)
-            loss, reconstruction_loss, commit_loss = self.optimizer.compute_loss(embeddings, tokenizer_output)
+            popularity_weights = self._batch_popularity_weights(item_ids)
+            loss, reconstruction_loss, commit_loss, popularity_balance_loss = self.optimizer.compute_loss(
+                embeddings,
+                tokenizer_output,
+                popularity_weights=popularity_weights,
+            )
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
             total_recon_loss += reconstruction_loss.item()
             total_commit_loss += commit_loss.item()
+            total_popularity_balance_loss += popularity_balance_loss.item()
             if len(progress_bar) % self.log_interval == 0:
-                progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'recon_loss': f'{reconstruction_loss.item():.4f}', 'commit_loss': f'{commit_loss.item():.4f}'})
-        return total_loss / len(train_dataloader), total_recon_loss / len(train_dataloader), total_commit_loss / len(train_dataloader)
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'recon_loss': f'{reconstruction_loss.item():.4f}',
+                    'commit_loss': f'{commit_loss.item():.4f}',
+                    'pop_balance_loss': f'{popularity_balance_loss.item():.4f}',
+                })
+        return (
+            total_loss / len(train_dataloader),
+            total_recon_loss / len(train_dataloader),
+            total_commit_loss / len(train_dataloader),
+            total_popularity_balance_loss / len(train_dataloader),
+        )
 
     def _save_checkpoint(self, epoch, metric_value=None, is_best=False, utilization_rate=None, collision_rate=None):
         if self.accelerator is not None and not self.accelerator.is_main_process:
@@ -164,10 +190,11 @@ class RQVAETrainer:
             else:
                 self.optimizer = actual_optimizer
         for epoch in range(self.epochs):
-            train_loss, train_recon, train_commit = self._train_one_epoch(train_dataloader, epoch)
+            train_loss, train_recon, train_commit, train_pop_balance = self._train_one_epoch(train_dataloader, epoch)
             if is_main:
                 logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.4f} | "
-                            f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f}")
+                            f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f} | "
+                            f"Train Popularity Balance Loss: {train_pop_balance:.4f}")
 
             if (epoch + 1) % 1000 == 0:
                 if is_main:

@@ -12,6 +12,10 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self.tokenizer = tokenizer
         
         self.quant_loss_weight = self.config['quant_loss_weight']
+        self.popularity_balance_weight = float(self.config.get('popularity_balance_weight', 0.0))
+        self.popularity_softmax_temperature = float(self.config.get('popularity_softmax_temperature', 1.0))
+        self.popularity_weight_transform = self.config.get('popularity_weight_transform', 'log1p')
+        self.popularity_balance_eps = float(self.config.get('popularity_balance_eps', 1e-8))
         learning_rate = self.config['learning_rate']
         
         # self.torch_optimizer = torch.optim.Adagrad(self.tokenizer.parameters(), lr=learning_rate)
@@ -41,13 +45,50 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
     def zero_grad(self):
         self.torch_optimizer.zero_grad()
     
-    def compute_loss(self, original_embeddings: torch.Tensor, tokenizer_output: tuple):
-        quantized_embeddings, _, commit_loss = tokenizer_output
+    def _transform_popularity_weights(self, popularity_weights: torch.Tensor):
+        popularity_weights = popularity_weights.float().clamp_min(0.0)
+        if self.popularity_weight_transform == 'none':
+            return popularity_weights
+        if self.popularity_weight_transform == 'log1p':
+            return torch.log1p(popularity_weights)
+        if self.popularity_weight_transform == 'sqrt':
+            return torch.sqrt(popularity_weights)
+        raise ValueError(f"Unsupported popularity_weight_transform: {self.popularity_weight_transform}")
+
+    def _compute_popularity_balance_loss(self, distances: torch.Tensor, popularity_weights: torch.Tensor):
+        if self.popularity_balance_weight <= 0.0:
+            return distances.new_tensor(0.0)
+        if distances is None or popularity_weights is None:
+            return distances.new_tensor(0.0) if distances is not None else torch.tensor(0.0)
+
+        temperature = max(self.popularity_softmax_temperature, self.popularity_balance_eps)
+        soft_assignment = torch.softmax(-distances / temperature, dim=-1)
+
+        weights = self._transform_popularity_weights(popularity_weights).to(
+            device=distances.device,
+            dtype=distances.dtype,
+        )
+        weighted_assignment = soft_assignment * weights.view(-1, 1, 1)
+        token_mass = weighted_assignment.sum(dim=0)
+        token_distribution = token_mass / token_mass.sum(dim=-1, keepdim=True).clamp_min(self.popularity_balance_eps)
+
+        entropy_objective = (
+            token_distribution * torch.log(token_distribution.clamp_min(self.popularity_balance_eps))
+        ).sum(dim=-1)
+        return entropy_objective.mean()
+
+    def compute_loss(self, original_embeddings: torch.Tensor, tokenizer_output: tuple, popularity_weights=None):
+        quantized_embeddings, _, commit_loss, distances = tokenizer_output
         
         reconstruction_loss = F.mse_loss(quantized_embeddings, original_embeddings)
-        total_loss = reconstruction_loss + self.quant_loss_weight * commit_loss
+        popularity_balance_loss = self._compute_popularity_balance_loss(distances, popularity_weights)
+        total_loss = (
+            reconstruction_loss
+            + self.quant_loss_weight * commit_loss
+            + self.popularity_balance_weight * popularity_balance_loss
+        )
         
-        return total_loss, reconstruction_loss, commit_loss
+        return total_loss, reconstruction_loss, commit_loss, popularity_balance_loss
 
     def step(self):
         self.torch_optimizer.step()

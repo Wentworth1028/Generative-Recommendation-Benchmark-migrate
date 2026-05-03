@@ -156,6 +156,7 @@ class RQVAETrainingPipeline:
     def _initialize_components(self):
         """Initializes the model, optimizer, and trainer."""
         print("\n--- Initializing Model, Optimizer, and Trainer ---")
+        self.config['item_popularity'] = self.item_popularity
         self.tokenizer = RQVAETokenizer(self.config)
         self.optimizer = RQVAETokenizerOptimizer(self.config, self.tokenizer)
         self.trainer = RQVAETrainer(self.config, self.tokenizer, self.optimizer, accelerator=self.accelerator)

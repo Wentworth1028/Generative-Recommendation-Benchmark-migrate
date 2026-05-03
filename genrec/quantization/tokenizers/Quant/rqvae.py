@@ -48,10 +48,10 @@ class RQVAE(nn.Module):
 
     def forward(self, x): 
         x = self.encoder(x)
-        x_q, rq_loss, indices = self.rq(x)
+        x_q, rq_loss, indices, all_distances = self.rq(x)
         out = self.decoder(x_q)
 
-        return out, rq_loss, indices, x_q
+        return out, rq_loss, indices, x_q, all_distances
 
     def vq_initialization(self, x):
         self.rq.vq_ini(self.encoder(x))
@@ -59,7 +59,7 @@ class RQVAE(nn.Module):
     @torch.no_grad()
     def get_indices(self, xs):
         x_e = self.encoder(xs)
-        _, _, indices = self.rq(x_e)
+        _, _, indices, _ = self.rq(x_e)
         return indices
 
     def compute_loss(self, out, quant_loss, dense_out, xs=None):
@@ -171,20 +171,23 @@ class ResidualVectorQuantizer(nn.Module):
     def forward(self, x):
         all_losses = []
         all_indices = []
+        all_distances = []
         x_q = 0
         residual = x
 
         for idx, quantizer in enumerate(self.vq_layers):
-            x_res, loss, indices = quantizer(residual, idx)
+            x_res, loss, indices, distances = quantizer(residual, idx)
             residual = residual - x_res
             x_q = x_q + x_res
             all_losses.append(loss)
             all_indices.append(indices)
+            all_distances.append(distances)
 
         mean_losses = torch.stack(all_losses).mean()
         all_indices = torch.stack(all_indices, dim=-1)
+        all_distances = torch.stack(all_distances, dim=1)
 
-        return x_q, mean_losses, all_indices
+        return x_q, mean_losses, all_indices, all_distances
 
 class VectorQuantizer(nn.Module):
     def __init__(self, n_e, e_dim, mu=0.25,
@@ -278,4 +281,4 @@ class VectorQuantizer(nn.Module):
         loss = codebook_loss + self.mu * commitment_loss
         x_q = x + (x_q - x).detach()
         indices = indices.view(x.shape[:-1])
-        return x_q, loss, indices
+        return x_q, loss, indices, d

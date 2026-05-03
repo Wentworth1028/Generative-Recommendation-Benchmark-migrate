@@ -57,8 +57,8 @@ class RQVAETokenizer(AbstractTokenizer, nn.Module):
         self.user_save_path = self.config['save_path'].replace('.json', '_users.json')
         self.tokens2item_save_path = self.config['save_path'].replace('.json', '_tokens2item.json')
     def forward(self, embeddings: torch.Tensor):
-        reconstructed_embeddings, quant_loss, indices, _ = self.rq_vae(embeddings)
-        return reconstructed_embeddings, indices, quant_loss
+        reconstructed_embeddings, quant_loss, indices, _, distances = self.rq_vae(embeddings)
+        return reconstructed_embeddings, indices, quant_loss, distances
     def initialize_rqvae(self, embeddings: np.ndarray):
         self.log('[TOKENIZER] Initializing codebooks with K-Means...')
         current_device = next(self.parameters()).device
