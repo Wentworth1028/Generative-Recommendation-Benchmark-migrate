@@ -120,8 +120,14 @@ class RQVAETrainer:
     def _train_one_epoch(self, train_dataloader, epoch: int):
         self.tokenizer.train()
         total_loss, total_recon_loss, total_commit_loss, total_popularity_balance_loss = 0.0, 0.0, 0.0, 0.0
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{self.epochs} [Training]", leave=False)
-        for item_ids, embeddings in progress_bar:
+        is_main = self.accelerator is None or self.accelerator.is_main_process
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch+1}/{self.epochs} [Training]",
+            leave=False,
+            disable=not is_main,
+        )
+        for step, (item_ids, embeddings) in enumerate(progress_bar, start=1):
             embeddings = embeddings.to(self.device)
             self.optimizer.zero_grad()
             tokenizer_output = self.tokenizer(embeddings)
@@ -137,7 +143,7 @@ class RQVAETrainer:
             total_recon_loss += reconstruction_loss.item()
             total_commit_loss += commit_loss.item()
             total_popularity_balance_loss += popularity_balance_loss.item()
-            if len(progress_bar) % self.log_interval == 0:
+            if is_main and self.log_interval and step % self.log_interval == 0:
                 progress_bar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'recon_loss': f'{reconstruction_loss.item():.4f}',

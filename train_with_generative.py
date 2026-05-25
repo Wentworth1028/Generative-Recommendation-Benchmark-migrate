@@ -17,7 +17,7 @@ from genrec.utils.common_utils import set_seed
 from genrec.utils.logging_utils import setup_logging
 from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
-from genrec.utils.popularity_metrics import compute_prediction_popularity_metrics, compute_train_item_popularity
+from genrec.utils.popularity_metrics import compute_dataset_item_popularity, compute_prediction_popularity_metrics
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -256,12 +256,11 @@ def stage2_train_generation_model(
                 item_ids.append(int(item_id))
             tiger_predictions.append(item_ids)
 
-        train_item_popularity = compute_train_item_popularity(model_config['data_interaction_files'], shift_item_id=0)
+        item_popularity = compute_dataset_item_popularity(model_config['data_interaction_files'], shift_item_id=0)
         popularity_metrics = compute_prediction_popularity_metrics(
             tiger_predictions,
-            train_item_popularity,
+            item_popularity,
             k_list=model_config.get("k_list", [1, 5, 10]),
-            quantiles=(0.1, 0.2),
         )
         metrics.update({f"test_{key}": value for key, value in popularity_metrics.items()})
 

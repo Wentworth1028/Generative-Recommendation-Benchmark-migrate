@@ -14,6 +14,7 @@ popularity_balance_weight: 0.0
 popularity_softmax_temperature: 1.0
 popularity_weight_transform: "log1p"
 popularity_balance_eps: 1e-8
+popularity_balance_disabled_layers: []
 commitment_beta: 0.25
 rq_kmeans_init: true
 kmeans_iters: 10

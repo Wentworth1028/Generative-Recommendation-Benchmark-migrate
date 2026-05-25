@@ -16,6 +16,9 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self.popularity_softmax_temperature = float(self.config.get('popularity_softmax_temperature', 1.0))
         self.popularity_weight_transform = self.config.get('popularity_weight_transform', 'log1p')
         self.popularity_balance_eps = float(self.config.get('popularity_balance_eps', 1e-8))
+        self.popularity_balance_disabled_layers = self._parse_disabled_layers(
+            self.config.get('popularity_balance_disabled_layers', [])
+        )
         learning_rate = self.config['learning_rate']
         
         # self.torch_optimizer = torch.optim.Adagrad(self.tokenizer.parameters(), lr=learning_rate)
@@ -55,6 +58,19 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
             return torch.sqrt(popularity_weights)
         raise ValueError(f"Unsupported popularity_weight_transform: {self.popularity_weight_transform}")
 
+    def _parse_disabled_layers(self, value):
+        if value is None or value == "":
+            return set()
+        if isinstance(value, str):
+            text = value.strip()
+            if text in ("[]", ""):
+                return set()
+            text = text.strip("[]")
+            return {int(item.strip()) for item in text.split(",") if item.strip()}
+        if isinstance(value, (list, tuple, set)):
+            return {int(item) for item in value}
+        return {int(value)}
+
     def _compute_popularity_balance_loss(self, distances: torch.Tensor, popularity_weights: torch.Tensor):
         if self.popularity_balance_weight <= 0.0:
             return distances.new_tensor(0.0)
@@ -75,7 +91,21 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         entropy_objective = (
             token_distribution * torch.log(token_distribution.clamp_min(self.popularity_balance_eps))
         ).sum(dim=-1)
-        return entropy_objective.mean()
+        if not self.popularity_balance_disabled_layers:
+            return entropy_objective.mean()
+
+        enabled_mask = torch.ones(
+            entropy_objective.size(0),
+            device=entropy_objective.device,
+            dtype=torch.bool,
+        )
+        for layer_idx in self.popularity_balance_disabled_layers:
+            if 0 <= layer_idx < enabled_mask.size(0):
+                enabled_mask[layer_idx] = False
+
+        if not enabled_mask.any():
+            return distances.new_tensor(0.0)
+        return entropy_objective[enabled_mask].mean()
 
     def compute_loss(self, original_embeddings: torch.Tensor, tokenizer_output: tuple, popularity_weights=None):
         quantized_embeddings, _, commit_loss, distances = tokenizer_output
