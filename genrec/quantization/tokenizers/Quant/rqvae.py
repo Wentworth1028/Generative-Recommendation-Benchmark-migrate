@@ -1,11 +1,28 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.init import xavier_normal_ 
 from torch.nn.init import xavier_normal_
 from sklearn.cluster import KMeans
-from k_means_constrained import KMeansConstrained
 
+@torch.no_grad()
+def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
+    Q = torch.exp(-distances / epsilon)
+
+    B = Q.shape[0]
+    K = Q.shape[1] 
+
+    sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
+    Q /= sum_Q
+
+    for it in range(sinkhorn_iterations):
+
+        Q /= torch.sum(Q, dim=1, keepdim=True)
+        Q /= B
+
+        Q /= torch.sum(Q, dim=0, keepdim=True)
+        Q /= K
+    Q *= B 
+    return Q
 class RQVAE(nn.Module):
     def __init__(self,
                  in_dim=768,
@@ -19,6 +36,8 @@ class RQVAE(nn.Module):
                  kmeans_init=False,
                  kmeans_iters=100,
                  commitment_beta=0.25,
+                 sk_epsilon=0.003,
+                 sk_iters=100,
                  ):
         super(RQVAE, self).__init__()
         self.in_dim = in_dim
@@ -32,16 +51,17 @@ class RQVAE(nn.Module):
         self.kmeans_init = kmeans_init
         self.kmeans_iters = kmeans_iters
         self.commitment_beta = commitment_beta
+        
         self.encode_layer_dims = [self.in_dim] + self.layers + [self.e_dim]
         self.encoder = MLPLayers(layers=self.encode_layer_dims,
                                  dropout=self.dropout_prob, bn=self.bn)
-
         self.rq = ResidualVectorQuantizer(num_emb_list, e_dim,
                                           commitment_beta=self.commitment_beta,
                                           kmeans_init=self.kmeans_init,
                                           kmeans_iters=self.kmeans_iters,
+                                          sk_epsilon=sk_epsilon,
+                                          sk_iters=sk_iters
                                           )
-
         self.decode_layer_dims = self.encode_layer_dims[::-1]
         self.decoder = MLPLayers(layers=self.decode_layer_dims,
                                  dropout=self.dropout_prob, bn=self.bn)
@@ -137,8 +157,9 @@ class MLPLayers(nn.Module):
         return self.mlp_layers(input_feature)
 
 class ResidualVectorQuantizer(nn.Module):
-    def __init__(self, n_e_list, e_dim,commitment_beta=0.25,
-                 kmeans_init=False, kmeans_iters=100):
+    def __init__(self, n_e_list, e_dim, commitment_beta=0.25,
+                 kmeans_init=False, kmeans_iters=100, 
+                 sk_epsilon=0.01, sk_iters=100):
         super().__init__()
         self.n_e_list = n_e_list
         self.e_dim = e_dim
@@ -147,9 +168,11 @@ class ResidualVectorQuantizer(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.commitment_beta = commitment_beta
         self.vq_layers = nn.ModuleList([VectorQuantizer(n_e, e_dim,
-                                                        mu = self.commitment_beta,
+                                                        mu=self.commitment_beta,
                                                         kmeans_init=self.kmeans_init,
-                                                        kmeans_iters=self.kmeans_iters
+                                                        kmeans_iters=self.kmeans_iters,
+                                                        sk_epsilon=sk_epsilon, # 传递给底层
+                                                        sk_iters=sk_iters      # 传递给底层
                                                         )
                                         for n_e in n_e_list])
 
@@ -164,7 +187,8 @@ class ResidualVectorQuantizer(nn.Module):
         x_q = 0
         residual = x
         for idx, quantizer in enumerate(self.vq_layers):
-            x_res = quantizer.vq_init(residual)
+            is_last_layer = (idx == self.num_quantizers - 1)
+            x_res = quantizer.vq_init(residual, use_sk=is_last_layer)
             residual = residual - x_res
             x_q = x_q + x_res
 
@@ -175,7 +199,8 @@ class ResidualVectorQuantizer(nn.Module):
         residual = x
 
         for idx, quantizer in enumerate(self.vq_layers):
-            x_res, loss, indices = quantizer(residual, idx)
+            is_last_layer = (idx == self.num_quantizers - 1)
+            x_res, loss, indices = quantizer(residual, idx, use_sk=is_last_layer)
             residual = residual - x_res
             x_q = x_q + x_res
             all_losses.append(loss)
@@ -188,13 +213,16 @@ class ResidualVectorQuantizer(nn.Module):
 
 class VectorQuantizer(nn.Module):
     def __init__(self, n_e, e_dim, mu=0.25,
-                 kmeans_init=False, kmeans_iters=10):
+                 kmeans_init=False, kmeans_iters=10,
+                 sk_epsilon=0.01, sk_iters=100):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
         self.mu = mu
         self.kmeans_init = kmeans_init
         self.kmeans_iters = kmeans_iters
+        self.sk_epsilon = sk_epsilon
+        self.sk_iters = sk_iters
 
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         if not kmeans_init:
@@ -222,7 +250,6 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.copy_(centers)
         self.initted = True
 
-
     @staticmethod
     def center_distance_for_constraint(distances):
         max_distance = distances.max()
@@ -233,10 +260,11 @@ class VectorQuantizer(nn.Module):
         centered_distances = (distances - middle) / amplitude
         return centered_distances
 
-    def vq_init(self, x):
+    def vq_init(self, x, use_sk=False): 
         latent = x.view(-1, self.e_dim)
         if not self.initted:
             self.init_emb(latent)
+            
         _distance_flag = 'distance'
         if _distance_flag == 'distance':
             d = torch.sum(latent ** 2, dim=1, keepdim=True) + \
@@ -244,17 +272,29 @@ class VectorQuantizer(nn.Module):
                 2 * torch.matmul(latent, self.embedding.weight.t())
         else:
             d = latent @ self.embedding.weight.t()
-        if _distance_flag == 'distance':
-            indices = torch.argmin(d, dim=-1)
+            
+        if not use_sk or self.sk_epsilon <= 0:
+            if _distance_flag == 'distance':
+                indices = torch.argmin(d, dim=-1)
+            else:
+                indices = torch.argmax(d, dim=-1)
         else:
-            indices = torch.argmax(d, dim=-1)
+            d_centered = self.center_distance_for_constraint(d)
+            d_centered = d_centered.double()
+
+            Q = sinkhorn_algorithm(d_centered, self.sk_epsilon, self.sk_iters)
+            if torch.isnan(Q).any() or torch.isinf(Q).any():
+                print(f"Sinkhorn Algorithm returns nan/inf values.")
+            indices = torch.argmax(Q, dim=-1)
+
         x_q = self.embedding(indices).view(x.shape)
         return x_q
 
-    def forward(self, x, idx):
+    def forward(self, x, idx, use_sk=False):
         latent = x.view(-1, self.e_dim)
         if not self.initted and self.training:
             self.init_emb(latent)
+            
         _distance_flag = 'distance'
         if _distance_flag == 'distance':
             d = torch.sum(latent ** 2, dim=1, keepdim=True) + \
@@ -262,20 +302,33 @@ class VectorQuantizer(nn.Module):
                 2 * torch.matmul(latent, self.embedding.weight.t())
         else:
             d = latent @ self.embedding.weight.t()
-        if _distance_flag == 'distance':
-            if idx != -1:
-                indices = torch.argmin(d, dim=-1)
+
+        if not use_sk or self.sk_epsilon <= 0:
+            if _distance_flag == 'distance':
+                if idx != -1:
+                    indices = torch.argmin(d, dim=-1)
+                else:
+                    temp = 1.0
+                    prob_dist = F.softmax(-d / temp, dim=1)
+                    indices = torch.multinomial(prob_dist, 1).squeeze()
             else:
-                temp = 1.0
-                prob_dist = F.softmax(-d / temp, dim=1)
-                indices = torch.multinomial(prob_dist, 1).squeeze()
+                indices = torch.argmax(d, dim=-1)
         else:
-            indices = torch.argmax(d, dim=-1)
+            d_centered = self.center_distance_for_constraint(d)
+            d_centered = d_centered.double()
+
+            Q = sinkhorn_algorithm(d_centered, self.sk_epsilon, self.sk_iters)
+            if torch.isnan(Q).any() or torch.isinf(Q).any():
+                print(f"Sinkhorn Algorithm returns nan/inf values.")
+            indices = torch.argmax(Q, dim=-1)
+        # ====================================================
 
         x_q = self.embedding(indices).view(x.shape)
         commitment_loss = F.mse_loss(x_q.detach(), x)
         codebook_loss = F.mse_loss(x_q, x.detach())
         loss = codebook_loss + self.mu * commitment_loss
+        
+        # preserve gradients
         x_q = x + (x_q - x).detach()
         indices = indices.view(x.shape[:-1])
         return x_q, loss, indices

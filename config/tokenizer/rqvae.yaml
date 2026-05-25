@@ -3,7 +3,7 @@ data_text_files: "./data/Toy/item2title.pkl"
 text_encoder_model: "../sentence-t5-base"
 interaction_files: "./data/Toy/user2item.pkl"
 sent_emb_dim: 768
-n_codebooks: 3
+n_codebooks: 4
 codebook_size: 256
 rq_e_dim: 32
 rq_layers: [512, 256, 128]
