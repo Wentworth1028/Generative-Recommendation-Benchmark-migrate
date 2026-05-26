@@ -201,7 +201,7 @@ class ResidualVectorQuantizer(nn.Module):
 
         for idx, quantizer in enumerate(self.vq_layers):
             is_last_layer = (idx == self.num_quantizers - 1)
-            x_res, loss, indices = quantizer(residual, idx, use_sk=is_last_layer)
+            x_res, loss, indices, distances = quantizer(residual, idx, use_sk=is_last_layer)
             residual = residual - x_res
             x_q = x_q + x_res
             all_losses.append(loss)

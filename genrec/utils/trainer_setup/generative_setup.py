@@ -11,7 +11,6 @@ from genrec.utils.callbacks.generative.generative_callback import (
     GenerativeLoggingCallback,
     EvaluateEveryNEpochsCallback,
     DelayedEvaluateEveryNEpochsCallback,
-    DelayedEvaluateEveryNEpochsCallback,
 )
 
 
@@ -31,8 +30,6 @@ def setup_training(
 ):
 
     training_args = TrainingArguments(
-        seed=model_config['seed'],
-        data_seed=model_config['seed'],
         lr_scheduler_type="cosine",
         output_dir=output_dirs['model'],
         num_train_epochs=model_config['num_epochs'],
