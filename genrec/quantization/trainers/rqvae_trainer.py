@@ -26,6 +26,15 @@ class RQVAETrainer:
         self.save_interval = self.config.get('save_interval')
         self.item_popularity = self.config.get('item_popularity', {})
         self.popularity_balance_weight = float(self.config.get('popularity_balance_weight', 0.0))
+        self.target_popularity_balance_weight = self.popularity_balance_weight
+        self.popularity_balance_schedule = self.config.get('popularity_balance_schedule', 'constant').lower()
+        self.popularity_balance_start_epoch = int(self.config.get('popularity_balance_start_epoch', 0))
+        self.popularity_balance_warmup_epochs = int(self.config.get('popularity_balance_warmup_epochs', 0))
+        if self.popularity_balance_schedule not in {'constant', 'linear', 'delayed'}:
+            raise ValueError(
+                f"Invalid popularity_balance_schedule: {self.popularity_balance_schedule}. "
+                "Must be 'constant', 'linear', or 'delayed'."
+            )
 
         self.save_best_on = self.config.get('save_best_on', 'collision_rate').lower()
         if self.save_best_on not in ['utilization', 'collision_rate']:
@@ -48,6 +57,30 @@ class RQVAETrainer:
             item_ids = item_ids.detach().cpu().tolist()
         weights = [float(self.item_popularity.get(int(item_id), 0.0)) for item_id in item_ids]
         return torch.tensor(weights, dtype=torch.float32, device=self.device)
+
+    def _scheduled_popularity_balance_weight(self, epoch: int) -> float:
+        if self.target_popularity_balance_weight <= 0.0:
+            return 0.0
+        if self.popularity_balance_schedule == 'constant':
+            return self.target_popularity_balance_weight
+
+        start_epoch = max(self.popularity_balance_start_epoch, 0)
+        if epoch < start_epoch:
+            return 0.0
+        if self.popularity_balance_schedule == 'delayed':
+            return self.target_popularity_balance_weight
+
+        warmup_epochs = max(self.popularity_balance_warmup_epochs, 0)
+        if warmup_epochs == 0:
+            return self.target_popularity_balance_weight
+
+        progress = min(1.0, (epoch - start_epoch + 1) / warmup_epochs)
+        return self.target_popularity_balance_weight * progress
+
+    def _set_popularity_balance_weight(self, weight: float):
+        self.popularity_balance_weight = weight
+        if hasattr(self.optimizer, 'popularity_balance_weight'):
+            self.optimizer.popularity_balance_weight = weight
 
     def _calculate_codebook_utilization(self, train_dataloader, log_output=True):
         self.tokenizer.eval()
@@ -196,11 +229,14 @@ class RQVAETrainer:
             else:
                 self.optimizer = actual_optimizer
         for epoch in range(self.epochs):
+            effective_popularity_weight = self._scheduled_popularity_balance_weight(epoch)
+            self._set_popularity_balance_weight(effective_popularity_weight)
             train_loss, train_recon, train_commit, train_pop_balance = self._train_one_epoch(train_dataloader, epoch)
             if is_main:
                 logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.4f} | "
                             f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f} | "
-                            f"Train Popularity Balance Loss: {train_pop_balance:.4f}")
+                            f"Train Popularity Balance Loss: {train_pop_balance:.4f} | "
+                            f"Popularity Balance Weight: {effective_popularity_weight:.6g}")
 
             if (epoch + 1) % 1000 == 0:
                 if is_main:

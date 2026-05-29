@@ -11,6 +11,9 @@ dropout_prob: 0
 loss_type: "mse"
 quant_loss_weight: 0.25
 popularity_balance_weight: 0.0
+popularity_balance_schedule: "constant"
+popularity_balance_start_epoch: 0
+popularity_balance_warmup_epochs: 0
 popularity_softmax_temperature: 1.0
 popularity_weight_transform: "log1p"
 popularity_balance_eps: 1e-8
