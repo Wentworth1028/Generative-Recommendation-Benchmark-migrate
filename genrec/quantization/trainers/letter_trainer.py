@@ -142,6 +142,8 @@ class LETTERRQVAETrainer:
             embeddings = embeddings.to(self.device)
             self.optimizer.zero_grad()
             tokenizer_output = self.tokenizer(embeddings, self.labels)
+            if torch.is_tensor(emb_idx):
+                emb_idx = emb_idx.detach().cpu().numpy()
             cf_embedding_in_batch = self.cf_embedding[emb_idx]
             cf_embedding_in_batch = torch.from_numpy(cf_embedding_in_batch).to(self.device)
             loss, reconstruction_loss, commit_loss, cf_loss = self.optimizer.compute_loss(embeddings, cf_embedding_in_batch, tokenizer_output)

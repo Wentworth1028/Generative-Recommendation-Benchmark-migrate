@@ -231,8 +231,12 @@ def stage2_train_generation_model(
         vocab_size=vocab_size,
     )
     model.config.use_cache = False
-    trainer.train()
-    accelerator.wait_for_everyone()
+    if do_inference_only:
+        if accelerator.is_main_process:
+            logger.info("skip training and run inference only.")
+    else:
+        trainer.train()
+        accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         logger.info("predict test set...")

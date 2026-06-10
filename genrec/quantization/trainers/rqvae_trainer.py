@@ -3,6 +3,7 @@ from genrec.quantization.tokenizers.base_tokenizer import AbstractTokenizer
 import torch
 import logging
 import os
+import csv
 from tqdm import tqdm
 import numpy as np
 from collections import Counter
@@ -30,6 +31,7 @@ class RQVAETrainer:
         self.popularity_balance_schedule = self.config.get('popularity_balance_schedule', 'constant').lower()
         self.popularity_balance_start_epoch = int(self.config.get('popularity_balance_start_epoch', 0))
         self.popularity_balance_warmup_epochs = int(self.config.get('popularity_balance_warmup_epochs', 0))
+        self.loss_history_path = os.path.join(os.path.dirname(self.checkpoint_path), "rqvae_loss_history.csv")
         if self.popularity_balance_schedule not in {'constant', 'linear', 'delayed'}:
             raise ValueError(
                 f"Invalid popularity_balance_schedule: {self.popularity_balance_schedule}. "
@@ -49,6 +51,59 @@ class RQVAETrainer:
             logging.info(f"The best model will be saved based on the best value of '{self.save_best_on}'.")
         # self.tokenizer.to(self.device)
         # self.optimizer.move_optimizer_state_to_device(self.device)
+
+    def _quant_loss_weight(self) -> float:
+        return float(getattr(self.optimizer, 'quant_loss_weight', self.config.get('quant_loss_weight', 1.0)))
+
+    def _rq_loss_without_pop(self, recon_loss: float, commit_loss: float) -> float:
+        return recon_loss + self._quant_loss_weight() * commit_loss
+
+    def _init_loss_history(self):
+        if self.accelerator is not None and not self.accelerator.is_main_process:
+            return
+        os.makedirs(os.path.dirname(self.loss_history_path), exist_ok=True)
+        with open(self.loss_history_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "epoch",
+                "total_epochs",
+                "total_loss",
+                "rq_loss_without_pop",
+                "recon_loss",
+                "commit_loss",
+                "quant_loss_weight",
+                "popularity_balance_loss",
+                "weighted_popularity_balance_loss",
+                "effective_popularity_balance_weight",
+            ])
+
+    def _append_loss_history(
+        self,
+        epoch: int,
+        train_loss: float,
+        train_recon: float,
+        train_commit: float,
+        train_pop_balance: float,
+        effective_popularity_weight: float,
+    ):
+        if self.accelerator is not None and not self.accelerator.is_main_process:
+            return
+        rq_loss_without_pop = self._rq_loss_without_pop(train_recon, train_commit)
+        weighted_pop_balance = effective_popularity_weight * train_pop_balance
+        with open(self.loss_history_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch + 1,
+                self.epochs,
+                f"{train_loss:.12e}",
+                f"{rq_loss_without_pop:.12e}",
+                f"{train_recon:.12e}",
+                f"{train_commit:.12e}",
+                f"{self._quant_loss_weight():.12e}",
+                f"{train_pop_balance:.12e}",
+                f"{weighted_pop_balance:.12e}",
+                f"{effective_popularity_weight:.12e}",
+            ])
 
     def _batch_popularity_weights(self, item_ids):
         if self.popularity_balance_weight <= 0.0:
@@ -177,11 +232,18 @@ class RQVAETrainer:
             total_commit_loss += commit_loss.item()
             total_popularity_balance_loss += popularity_balance_loss.item()
             if is_main and self.log_interval and step % self.log_interval == 0:
+                weighted_popularity_balance_loss = self.popularity_balance_weight * popularity_balance_loss.item()
+                rq_loss_without_pop = self._rq_loss_without_pop(
+                    reconstruction_loss.item(),
+                    commit_loss.item(),
+                )
                 progress_bar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'recon_loss': f'{reconstruction_loss.item():.4f}',
-                    'commit_loss': f'{commit_loss.item():.4f}',
-                    'pop_balance_loss': f'{popularity_balance_loss.item():.4f}',
+                    'loss': f'{loss.item():.6e}',
+                    'rq_no_pop': f'{rq_loss_without_pop:.6e}',
+                    'recon_loss': f'{reconstruction_loss.item():.6e}',
+                    'commit_loss': f'{commit_loss.item():.6e}',
+                    'pop_balance_loss': f'{popularity_balance_loss.item():.6e}',
+                    'weighted_pop': f'{weighted_popularity_balance_loss:.6e}',
                 })
         return (
             total_loss / len(train_dataloader),
@@ -228,15 +290,29 @@ class RQVAETrainer:
                 self.optimizer.optimizer = actual_optimizer
             else:
                 self.optimizer = actual_optimizer
+        if is_main:
+            self._init_loss_history()
         for epoch in range(self.epochs):
             effective_popularity_weight = self._scheduled_popularity_balance_weight(epoch)
             self._set_popularity_balance_weight(effective_popularity_weight)
             train_loss, train_recon, train_commit, train_pop_balance = self._train_one_epoch(train_dataloader, epoch)
             if is_main:
-                logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.4f} | "
-                            f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f} | "
-                            f"Train Popularity Balance Loss: {train_pop_balance:.4f} | "
-                            f"Popularity Balance Weight: {effective_popularity_weight:.6g}")
+                rq_loss_without_pop = self._rq_loss_without_pop(train_recon, train_commit)
+                weighted_pop_balance = effective_popularity_weight * train_pop_balance
+                logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.8e} | "
+                            f"RQ Loss Without Pop: {rq_loss_without_pop:.8e} | "
+                            f"Train Recon Loss: {train_recon:.8e} | Train Commit Loss: {train_commit:.8e} | "
+                            f"Train Popularity Balance Loss: {train_pop_balance:.8e} | "
+                            f"Weighted Popularity Balance Loss: {weighted_pop_balance:.8e} | "
+                            f"Popularity Balance Weight: {effective_popularity_weight:.8e}")
+                self._append_loss_history(
+                    epoch,
+                    train_loss,
+                    train_recon,
+                    train_commit,
+                    train_pop_balance,
+                    effective_popularity_weight,
+                )
 
             if (epoch + 1) % 1000 == 0:
                 if is_main:

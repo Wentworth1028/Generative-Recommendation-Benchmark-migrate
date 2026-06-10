@@ -110,7 +110,7 @@ def main(cfg: DictConfig):
     if not tokenizer_success:
         if accelerator.is_main_process:
             logger.info("Tokenizer train error")
-        return
+        raise SystemExit(1)
     success = success and tokenizer_success
     accelerator.wait_for_everyone() 
     

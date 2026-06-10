@@ -7,6 +7,7 @@ from sklearn.cluster import KMeans
 from k_means_constrained import KMeansConstrained
 from .rqvae import RQVAE, ResidualVectorQuantizer, VectorQuantizer
 import random
+import math
 class LETTERRQVAE(RQVAE):
     def __init__(self,
                  in_dim=768,
@@ -111,8 +112,11 @@ class LETTERVectorQuantizer(VectorQuantizer):
         self.initted = True
     def constrained_km(self, data, n_clusters=10):
         x = data.cpu().detach().numpy()
-        size_min = min(len(data) // (n_clusters * 2), 50)
-        clf = KMeansConstrained(n_clusters=n_clusters, size_min=size_min, size_max=size_min * 4, max_iter=10, n_init=10,
+        n_samples = len(data)
+        size_min = max(1, min(n_samples // n_clusters, 50))
+        size_max = max(size_min, math.ceil(n_samples / n_clusters), size_min * 4)
+        size_max = min(n_samples, size_max)
+        clf = KMeansConstrained(n_clusters=n_clusters, size_min=size_min, size_max=size_max, max_iter=10, n_init=10,
                                 n_jobs=10, verbose=False)
         clf.fit(x)
         t_centers = torch.from_numpy(clf.cluster_centers_)
