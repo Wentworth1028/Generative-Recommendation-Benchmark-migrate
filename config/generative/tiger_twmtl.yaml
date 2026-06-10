@@ -1,0 +1,14 @@
+# config/generative/tiger_twmtl.yaml
+type: "tiger_twmtl"
+trainer:
+  _target_: genrec.trainers.generative.twmtl_trainer.TWMTLTigerTrainer
+  _partial_: true
+  sid_length: 4
+  beta: 0.99
+  curriculum_c: 2e-5
+  eps: 1e-8
+  initial_lambda_fg: 1.0
+  initial_lambda_fr: 1.0
+  initial_lambda_or: 1.0
+  repair_duplicate_sids: true
+

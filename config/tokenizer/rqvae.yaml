@@ -31,3 +31,13 @@ final_model_decision: "save_best"
 cf_emb_path: "sasrec_cf_embedding.pt"
 diversity_beta: 1e-4
 cf_alpha: 0.02
+
+crab:
+  enabled: false
+  split_ratio: 0.10
+  analysis_top_ratio: 0.05
+  max_splits: 3
+  balance_weight: 1.0
+  kmeans_max_iter: 50
+  reg_weight: 1e-3
+  random_seed: 2026
