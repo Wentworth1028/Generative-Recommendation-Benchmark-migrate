@@ -24,6 +24,11 @@ class LETTERRQVAETrainer:
         self.log_interval = self.config.get('log_interval')
         self.checkpoint_path = self.config.get('checkpoint_path')
         self.save_interval = self.config.get('save_interval')
+        self.tensorboard_enabled = self._as_bool(self.config.get('tensorboard_enabled', False))
+        self.tensorboard_dir = self.config.get('tensorboard_dir')
+        if not self.tensorboard_dir:
+            self.tensorboard_dir = os.path.join(os.path.dirname(self.checkpoint_path), "tensorboard")
+        self.summary_writer = None
 
         self.save_best_on = self.config.get('save_best_on', 'collision_rate').lower()
         if self.save_best_on not in ['utilization', 'collision_rate']:
@@ -50,6 +55,47 @@ class LETTERRQVAETrainer:
                          f"After slicing [1:]: {list(self.cf_embedding.shape)}")
         else:
             raise FileNotFoundError(f"[ERROR] CF embedding path does not exist: {self.cf_emb_path}")
+
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    def _init_tensorboard_writer(self):
+        if self.accelerator is not None and not self.accelerator.is_main_process:
+            return
+        if not self.tensorboard_enabled:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ModuleNotFoundError:
+            logging.info("TensorBoard is not installed; LETTER scalar events will not be written.")
+            return
+        os.makedirs(self.tensorboard_dir, exist_ok=True)
+        self.summary_writer = SummaryWriter(log_dir=self.tensorboard_dir)
+        logging.info(f"LETTER TensorBoard scalars will be written to {self.tensorboard_dir}")
+
+    def _append_tensorboard_scalars(
+        self,
+        epoch: int,
+        train_loss: float,
+        train_recon: float,
+        train_commit: float,
+        train_cf: float,
+    ):
+        if self.summary_writer is None:
+            return
+        self.summary_writer.add_scalar("letter/total_loss", train_loss, epoch)
+        self.summary_writer.add_scalar("letter/recon_loss", train_recon, epoch)
+        self.summary_writer.add_scalar("letter/commit_loss", train_commit, epoch)
+        self.summary_writer.add_scalar("letter/cf_loss", train_cf, epoch)
+        self.summary_writer.flush()
+
     def _calculate_codebook_utilization(self, train_dataloader, log_output=True):
         self.tokenizer.eval()
         
@@ -196,11 +242,20 @@ class LETTERRQVAETrainer:
                 self.optimizer.optimizer = actual_optimizer
             else:
                 self.optimizer = actual_optimizer
+        if is_main:
+            self._init_tensorboard_writer()
         for epoch in range(self.epochs):
             train_loss, train_recon, train_commit, train_cf = self._train_one_epoch(train_dataloader, epoch)
             if is_main:
                 logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.4f} | "
                          f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f} | Train CF Loss: {train_cf:.4f}")
+                self._append_tensorboard_scalars(
+                    epoch + 1,
+                    train_loss,
+                    train_recon,
+                    train_commit,
+                    train_cf,
+                )
 
             if (epoch + 1) % 1000 == 0:
                 if is_main:
@@ -259,3 +314,7 @@ class LETTERRQVAETrainer:
         best_original_value_final = self.best_metric_value if self.save_best_on == 'utilization' else 1.0 - self.best_metric_value
         if is_main:
             logging.info(f"Training complete. Best {self.save_best_on}: {best_original_value_final:.4f} at epoch {self.best_epoch+1}")
+        if self.summary_writer is not None:
+            self.summary_writer.flush()
+            self.summary_writer.close()
+            self.summary_writer = None

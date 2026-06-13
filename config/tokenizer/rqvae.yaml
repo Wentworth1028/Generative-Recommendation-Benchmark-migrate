@@ -18,6 +18,7 @@ popularity_softmax_temperature: 1.0
 popularity_weight_transform: "log1p"
 popularity_balance_eps: 1e-8
 popularity_balance_disabled_layers: []
+popularity_balance_top_k: 0
 commitment_beta: 0.25
 rq_kmeans_init: true
 kmeans_iters: 10
@@ -26,6 +27,8 @@ epochs: 20000
 batch_size: 1024
 log_interval: 10
 save_interval: 2000
+tensorboard_enabled: false
+tensorboard_dir: null
 embedding_strategy: "mean_pooling"
 final_model_decision: "save_best"
 cf_emb_path: "sasrec_cf_embedding.pt"

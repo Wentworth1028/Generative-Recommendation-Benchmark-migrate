@@ -1,0 +1,69 @@
+name: letter_crab_lite_best_baseline
+
+datasets:
+  - electronic
+  - movielens
+  - sports
+  - toy
+
+paths:
+  interaction_template: ./data/{dataset}/user2item.pkl
+  text_template: ./data/{dataset}/item2title.pkl
+  tokenizer_template: output/test_letter_crab_lite_best_baseline/{dataset}/letter_crab_bal1/tokenizer_model
+
+output:
+  base_dir: output/test_letter_crab_lite_best_baseline
+
+runtime:
+  keep_going: true
+  skip_completed: true
+  write_task_logs: true
+  generation:
+    num_processes: 4
+    gpu_groups:
+      - ids: "0,1,2,3"
+        port: 29628
+      - ids: "4,5,6,7"
+        port: 29629
+
+experiment:
+  type: letter
+  generative: letter
+  model_seed: 42
+  force_retrain_model: true
+  skip_tokenizer: true
+
+stages:
+  tokenizer: false
+  generation: true
+
+sweep:
+  output_prefix: letter_crab_bal1
+
+parameters:
+  model.learning_rate:
+    by_dataset:
+      electronic: "0.001"
+      movielens: "0.0015"
+      sports: "0.0015"
+      toy: "0.001"
+  model.weight_decay:
+    by_dataset:
+      electronic: 0.05
+      movielens: 0.1
+      sports: 0.15
+      toy: 0.25
+  model.batch_size: 1024
+  model.test_batch_size: 256
+  model.max_seq_len:
+    by_dataset:
+      electronic: 20
+      movielens: 50
+      sports: 20
+      toy: 20
+  model.num_epochs: 200
+  model.tie_word_embeddings: false
+
+summary:
+  enabled: true
+

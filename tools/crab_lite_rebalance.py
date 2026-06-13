@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from genrec.quantization.data.dataset.rqvae_dataset import ItemEmbeddingDataset
+from genrec.quantization.tokenizers.letter_tokenizer import LETTERRQVAETokenizer
 from genrec.quantization.tokenizers.rqvae_tokenizer import RQVAETokenizer
 
 
@@ -181,13 +182,20 @@ def semantic_ids_from_tokens(
     return item2sem
 
 
-def load_rqvae_tokenizer(config: dict, tokenizer_dir: Path, device: str) -> RQVAETokenizer:
+def tokenizer_class(tokenizer_kind: str):
+    if tokenizer_kind == "letter":
+        return LETTERRQVAETokenizer
+    if tokenizer_kind == "tiger":
+        return RQVAETokenizer
+    raise ValueError(f"Unsupported tokenizer kind: {tokenizer_kind}")
+
+
+def load_rqvae_tokenizer(config: dict, tokenizer_dir: Path, device: str, tokenizer_kind: str) -> RQVAETokenizer:
     tokenizer_config = dict(config)
     tokenizer_config["save_path"] = str(tokenizer_dir / "item2tokens.json")
     tokenizer_config["checkpoint_path"] = str(tokenizer_dir / "tokenizer_checkpoint.pth")
     tokenizer_config["tokenizer_path"] = str(tokenizer_dir / "tokenizer.pkl")
     tokenizer_config["device"] = device
-    tokenizer = RQVAETokenizer(tokenizer_config)
 
     checkpoint_path = tokenizer_dir / "tokenizer_checkpoint.pth"
     if not checkpoint_path.exists():
@@ -197,6 +205,18 @@ def load_rqvae_tokenizer(config: dict, tokenizer_dir: Path, device: str) -> RQVA
     clean_state = {}
     for key, value in state_dict.items():
         clean_state[key[len("rq_vae.") : ] if key.startswith("rq_vae.") else key] = value
+
+    codebook_keys = sorted(
+        key for key in clean_state
+        if key.startswith("rq.vq_layers.") and key.endswith(".embedding.weight")
+    )
+    if codebook_keys:
+        first_codebook = clean_state[codebook_keys[0]]
+        tokenizer_config["codebook_size"] = int(first_codebook.shape[0])
+        tokenizer_config["rq_e_dim"] = int(first_codebook.shape[1])
+        tokenizer_config["n_codebooks"] = len(codebook_keys)
+
+    tokenizer = tokenizer_class(tokenizer_kind)(tokenizer_config)
     tokenizer.rq_vae.load_state_dict(clean_state)
     tokenizer.rq_vae.to(device)
     tokenizer.rq_vae.eval()
@@ -413,7 +433,10 @@ def run_crab_lite(args: argparse.Namespace) -> None:
     item2tokens_original = load_item2tokens(source_tokenizer_dir / "item2tokens.json")
     user_ids, item_popularity, user_sequences = load_user_ids_and_popularity(Path(args.interaction_file))
 
-    tokenizer = load_rqvae_tokenizer(config, source_tokenizer_dir, device)
+    tokenizer = load_rqvae_tokenizer(config, source_tokenizer_dir, device, args.tokenizer_kind)
+    config["n_codebooks"] = int(tokenizer.config["n_codebooks"])
+    config["codebook_size"] = int(tokenizer.config["codebook_size"])
+    config["rq_e_dim"] = int(tokenizer.config["rq_e_dim"])
     reserve_tokens = tokenizer.reserve_tokens
     num_user_tokens = tokenizer.num_user_tokens
     n_codebooks = int(config["n_codebooks"])
@@ -611,7 +634,7 @@ def run_crab_lite(args: argparse.Namespace) -> None:
     tokenizer_config["save_path"] = str(output_tokenizer_dir / "item2tokens.json")
     tokenizer_config["checkpoint_path"] = str(output_tokenizer_dir / "tokenizer_checkpoint.pth")
     tokenizer_config["tokenizer_path"] = str(output_tokenizer_dir / "tokenizer.pkl")
-    rebalanced_tokenizer = RQVAETokenizer(tokenizer_config)
+    rebalanced_tokenizer = tokenizer_class(args.tokenizer_kind)(tokenizer_config)
     rebalanced_tokenizer.item2tokens = {k: tuple(v) for k, v in item2tokens.items()}
     rebalanced_tokenizer.tokens2item = tokens2item
     rebalanced_tokenizer.user2tokens = user2tokens
@@ -628,6 +651,7 @@ def run_crab_lite(args: argparse.Namespace) -> None:
         "semantic_vocab_size": user_token_start_idx,
         "vocab_size_with_user_tokens": user_token_start_idx + num_user_tokens,
         "crab": {
+            "tokenizer_kind": args.tokenizer_kind,
             "split_ratio": args.split_ratio,
             "analysis_top_ratio": args.analysis_top_ratio,
             "max_splits": args.max_splits,
@@ -645,6 +669,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="config/tokenizer/rqvae.yaml")
     parser.add_argument("--tokenizer-dir", required=True, help="Source tokenizer_model directory.")
     parser.add_argument("--output-tokenizer-dir", required=True, help="Destination rebalanced tokenizer_model directory.")
+    parser.add_argument("--tokenizer-kind", choices=["tiger", "letter"], default="tiger")
     parser.add_argument("--data-text-files", required=True)
     parser.add_argument("--interaction-file", required=True)
     parser.add_argument("--split-ratio", type=float, default=None)

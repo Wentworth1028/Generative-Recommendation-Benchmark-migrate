@@ -3,7 +3,6 @@ from genrec.quantization.tokenizers.base_tokenizer import AbstractTokenizer
 import torch
 import logging
 import os
-import csv
 from tqdm import tqdm
 import numpy as np
 from collections import Counter
@@ -31,7 +30,11 @@ class RQVAETrainer:
         self.popularity_balance_schedule = self.config.get('popularity_balance_schedule', 'constant').lower()
         self.popularity_balance_start_epoch = int(self.config.get('popularity_balance_start_epoch', 0))
         self.popularity_balance_warmup_epochs = int(self.config.get('popularity_balance_warmup_epochs', 0))
-        self.loss_history_path = os.path.join(os.path.dirname(self.checkpoint_path), "rqvae_loss_history.csv")
+        self.tensorboard_enabled = self._as_bool(self.config.get('tensorboard_enabled', False))
+        self.tensorboard_dir = self.config.get('tensorboard_dir')
+        if not self.tensorboard_dir:
+            self.tensorboard_dir = os.path.join(os.path.dirname(self.checkpoint_path), "tensorboard")
+        self.summary_writer = None
         if self.popularity_balance_schedule not in {'constant', 'linear', 'delayed'}:
             raise ValueError(
                 f"Invalid popularity_balance_schedule: {self.popularity_balance_schedule}. "
@@ -52,32 +55,39 @@ class RQVAETrainer:
         # self.tokenizer.to(self.device)
         # self.optimizer.move_optimizer_state_to_device(self.device)
 
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
     def _quant_loss_weight(self) -> float:
         return float(getattr(self.optimizer, 'quant_loss_weight', self.config.get('quant_loss_weight', 1.0)))
 
     def _rq_loss_without_pop(self, recon_loss: float, commit_loss: float) -> float:
         return recon_loss + self._quant_loss_weight() * commit_loss
 
-    def _init_loss_history(self):
+    def _init_training_trace(self):
         if self.accelerator is not None and not self.accelerator.is_main_process:
             return
-        os.makedirs(os.path.dirname(self.loss_history_path), exist_ok=True)
-        with open(self.loss_history_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "epoch",
-                "total_epochs",
-                "total_loss",
-                "rq_loss_without_pop",
-                "recon_loss",
-                "commit_loss",
-                "quant_loss_weight",
-                "popularity_balance_loss",
-                "weighted_popularity_balance_loss",
-                "effective_popularity_balance_weight",
-            ])
+        if self.tensorboard_enabled:
+            self._init_tensorboard_writer()
 
-    def _append_loss_history(
+    def _init_tensorboard_writer(self):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ModuleNotFoundError:
+            logging.info("TensorBoard is not installed; RQ-VAE scalar events will not be written.")
+            return
+        os.makedirs(self.tensorboard_dir, exist_ok=True)
+        self.summary_writer = SummaryWriter(log_dir=self.tensorboard_dir)
+        logging.info(f"RQ-VAE TensorBoard scalars will be written to {self.tensorboard_dir}")
+
+    def _append_training_trace(
         self,
         epoch: int,
         train_loss: float,
@@ -90,20 +100,47 @@ class RQVAETrainer:
             return
         rq_loss_without_pop = self._rq_loss_without_pop(train_recon, train_commit)
         weighted_pop_balance = effective_popularity_weight * train_pop_balance
-        with open(self.loss_history_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                epoch + 1,
-                self.epochs,
-                f"{train_loss:.12e}",
-                f"{rq_loss_without_pop:.12e}",
-                f"{train_recon:.12e}",
-                f"{train_commit:.12e}",
-                f"{self._quant_loss_weight():.12e}",
-                f"{train_pop_balance:.12e}",
-                f"{weighted_pop_balance:.12e}",
-                f"{effective_popularity_weight:.12e}",
-            ])
+        self._append_tensorboard_scalars(
+            epoch + 1,
+            train_loss,
+            rq_loss_without_pop,
+            train_recon,
+            train_commit,
+            train_pop_balance,
+            weighted_pop_balance,
+            effective_popularity_weight,
+        )
+
+    def _append_tensorboard_scalars(
+        self,
+        epoch: int,
+        train_loss: float,
+        rq_loss_without_pop: float,
+        train_recon: float,
+        train_commit: float,
+        train_pop_balance: float,
+        weighted_pop_balance: float,
+        effective_popularity_weight: float,
+    ):
+        if self.summary_writer is None:
+            return
+        self.summary_writer.add_scalar("rqvae/total_loss", train_loss, epoch)
+        self.summary_writer.add_scalar("rqvae/rq_loss_without_pop", rq_loss_without_pop, epoch)
+        self.summary_writer.add_scalar("rqvae/recon_loss", train_recon, epoch)
+        self.summary_writer.add_scalar("rqvae/commit_loss", train_commit, epoch)
+        self.summary_writer.add_scalar("rqvae/quant_loss_weight", self._quant_loss_weight(), epoch)
+        self.summary_writer.add_scalar("rqvae/popularity_balance_loss", train_pop_balance, epoch)
+        self.summary_writer.add_scalar(
+            "rqvae/weighted_popularity_balance_loss",
+            weighted_pop_balance,
+            epoch,
+        )
+        self.summary_writer.add_scalar(
+            "rqvae/effective_popularity_balance_weight",
+            effective_popularity_weight,
+            epoch,
+        )
+        self.summary_writer.flush()
 
     def _batch_popularity_weights(self, item_ids):
         if self.popularity_balance_weight <= 0.0:
@@ -291,7 +328,7 @@ class RQVAETrainer:
             else:
                 self.optimizer = actual_optimizer
         if is_main:
-            self._init_loss_history()
+            self._init_training_trace()
         for epoch in range(self.epochs):
             effective_popularity_weight = self._scheduled_popularity_balance_weight(epoch)
             self._set_popularity_balance_weight(effective_popularity_weight)
@@ -305,7 +342,7 @@ class RQVAETrainer:
                             f"Train Popularity Balance Loss: {train_pop_balance:.8e} | "
                             f"Weighted Popularity Balance Loss: {weighted_pop_balance:.8e} | "
                             f"Popularity Balance Weight: {effective_popularity_weight:.8e}")
-                self._append_loss_history(
+                self._append_training_trace(
                     epoch,
                     train_loss,
                     train_recon,
@@ -371,3 +408,7 @@ class RQVAETrainer:
         best_original_value_final = self.best_metric_value if self.save_best_on == 'utilization' else 1.0 - self.best_metric_value
         if is_main:
             logging.info(f"Training complete. Best {self.save_best_on}: {best_original_value_final:.4f} at epoch {self.best_epoch+1}")
+        if self.summary_writer is not None:
+            self.summary_writer.flush()
+            self.summary_writer.close()
+            self.summary_writer = None

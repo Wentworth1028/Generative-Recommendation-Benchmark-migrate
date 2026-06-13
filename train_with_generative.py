@@ -17,7 +17,11 @@ from genrec.utils.common_utils import set_seed
 from genrec.utils.logging_utils import setup_logging
 from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
-from genrec.utils.popularity_metrics import compute_dataset_item_popularity, compute_prediction_popularity_metrics
+from genrec.utils.popularity_metrics import (
+    compute_dataset_item_popularity,
+    compute_prediction_popularity_metrics,
+    compute_token_popularity_metrics,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -266,7 +270,12 @@ def stage2_train_generation_model(
             item_popularity,
             k_list=model_config.get("k_list", [1, 5, 10]),
         )
+        token_popularity_metrics = compute_token_popularity_metrics(
+            tokenizer.item2tokens,
+            item_popularity,
+        )
         metrics.update({f"test_{key}": value for key, value in popularity_metrics.items()})
+        metrics.update({f"test_{key}": value for key, value in token_popularity_metrics.items()})
 
         k_values = sorted(
             list(
@@ -287,6 +296,8 @@ def stage2_train_generation_model(
             logger.info(f"Hit@{k}: {hit_val:.4f}, NDCG@{k}: {ndcg_val:.4f}")
         for key, value in popularity_metrics.items():
             logger.info(f"{key}: {value:.4f}")
+        for key, value in token_popularity_metrics.items():
+            logger.info(f"{key}: {value:.4f}")
 
         logger.info("=" * 75)
         final_metrics = {
@@ -300,6 +311,7 @@ def stage2_train_generation_model(
             "inference_mode": model_config.get("inference_mode"),
             "metrics": {key: float(value) for key, value in metrics.items()},
             "popularity_metrics": {key: float(value) for key, value in popularity_metrics.items()},
+            "token_popularity_metrics": {key: float(value) for key, value in token_popularity_metrics.items()},
             "config": {
                 "learning_rate": model_config.get("learning_rate"),
                 "weight_decay": model_config.get("weight_decay"),

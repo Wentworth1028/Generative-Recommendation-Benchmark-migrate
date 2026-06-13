@@ -16,6 +16,7 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self.popularity_softmax_temperature = float(self.config.get('popularity_softmax_temperature', 1.0))
         self.popularity_weight_transform = self.config.get('popularity_weight_transform', 'log1p')
         self.popularity_balance_eps = float(self.config.get('popularity_balance_eps', 1e-8))
+        self.popularity_balance_top_k = int(self.config.get('popularity_balance_top_k', 0) or 0)
         self.popularity_balance_disabled_layers = self._parse_disabled_layers(
             self.config.get('popularity_balance_disabled_layers', [])
         )
@@ -78,7 +79,20 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
             return distances.new_tensor(0.0) if distances is not None else torch.tensor(0.0)
 
         temperature = max(self.popularity_softmax_temperature, self.popularity_balance_eps)
-        soft_assignment = torch.softmax(-distances / temperature, dim=-1)
+        logits = -distances / temperature
+        if self.popularity_balance_top_k > 0 and self.popularity_balance_top_k < distances.size(-1):
+            _, topk_indices = torch.topk(
+                distances,
+                k=self.popularity_balance_top_k,
+                dim=-1,
+                largest=False,
+            )
+            topk_logits = logits.gather(dim=-1, index=topk_indices)
+            topk_assignment = torch.softmax(topk_logits, dim=-1)
+            soft_assignment = torch.zeros_like(logits)
+            soft_assignment.scatter_(dim=-1, index=topk_indices, src=topk_assignment)
+        else:
+            soft_assignment = torch.softmax(logits, dim=-1)
 
         weights = self._transform_popularity_weights(popularity_weights).to(
             device=distances.device,

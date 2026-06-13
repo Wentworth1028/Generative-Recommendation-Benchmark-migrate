@@ -240,6 +240,9 @@ class TWMTLTigerTrainer(TigerTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         loss_mask = inputs.pop("loss_mask", None)
         labels = inputs.get("labels")
+        attr_model = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
+        if hasattr(attr_model, "module"):
+            attr_model = attr_model.module
 
         outputs = model(**inputs)
         if labels is None:
@@ -266,10 +269,10 @@ class TWMTLTigerTrainer(TigerTrainer):
         if self.eos_token_id is not None:
             mask_sid = mask_sid & sid_labels.ne(int(self.eos_token_id))
 
-        fg_weights = model.twmtl_fg_weights[:sid_len].to(device=logits.device, dtype=ce_sid.dtype)
+        fg_weights = attr_model.twmtl_fg_weights[:sid_len].to(device=logits.device, dtype=ce_sid.dtype)
         loss_fg = (ce_sid * fg_weights.unsqueeze(0) * mask_sid).sum() / mask_sid.sum().clamp_min(1)
 
-        freq_counts = model.twmtl_freq_counts[:sid_len].to(logits.device)
+        freq_counts = attr_model.twmtl_freq_counts[:sid_len].to(logits.device)
         safe_labels = sid_labels.clamp_min(0).clamp_max(freq_counts.size(1) - 1)
         pos_ids = torch.arange(sid_len, device=logits.device).unsqueeze(0).expand_as(safe_labels)
         counts = freq_counts[pos_ids, safe_labels].clamp_min(1).to(dtype=ce_sid.dtype)
@@ -280,9 +283,9 @@ class TWMTLTigerTrainer(TigerTrainer):
         fr_weights = raw_fr / fr_denom * self.sid_length
         loss_fr = (ce_sid * fr_weights * mask_sid).sum() / mask_sid.sum().clamp_min(1)
 
-        eta_fg = getattr(model, "twmtl_eta_fg")
-        eta_fr = getattr(model, "twmtl_eta_fr")
-        eta_or = getattr(model, "twmtl_eta_or")
+        eta_fg = getattr(attr_model, "twmtl_eta_fg")
+        eta_fr = getattr(attr_model, "twmtl_eta_fr")
+        eta_or = getattr(attr_model, "twmtl_eta_or")
         lambda_fg = F.softplus(eta_fg) + self.twmtl_eps
         lambda_fr = F.softplus(eta_fr) + self.twmtl_eps
         lambda_or = F.softplus(eta_or) + self.twmtl_eps
