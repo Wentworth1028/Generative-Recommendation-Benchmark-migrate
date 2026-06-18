@@ -11,6 +11,7 @@
 # hydra
 /outputs/
 /scripts/
+/tools/
 /output/
 /data/
 /predictions.json
