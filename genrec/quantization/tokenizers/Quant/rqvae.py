@@ -68,10 +68,10 @@ class RQVAE(nn.Module):
 
     def forward(self, x): 
         x = self.encoder(x)
-        x_q, rq_loss, indices, all_distances = self.rq(x)
+        x_q, rq_loss, indices, all_distances, quantization_context = self.rq(x)
         out = self.decoder(x_q)
 
-        return out, rq_loss, indices, x_q, all_distances
+        return out, rq_loss, indices, x_q, all_distances, quantization_context
 
     def vq_initialization(self, x):
         self.rq.vq_ini(self.encoder(x))
@@ -79,7 +79,7 @@ class RQVAE(nn.Module):
     @torch.no_grad()
     def get_indices(self, xs):
         x_e = self.encoder(xs)
-        _, _, indices, _ = self.rq(x_e)
+        _, _, indices, _, _ = self.rq(x_e)
         return indices
 
     def compute_loss(self, out, quant_loss, dense_out, xs=None):
@@ -196,11 +196,15 @@ class ResidualVectorQuantizer(nn.Module):
         all_losses = []
         all_indices = []
         all_distances = []
+        all_residuals = []
+        all_codebooks = []
         x_q = 0
         residual = x
 
         for idx, quantizer in enumerate(self.vq_layers):
             is_last_layer = (idx == self.num_quantizers - 1)
+            all_residuals.append(residual)
+            all_codebooks.append(quantizer.embedding.weight)
             x_res, loss, indices, distances = quantizer(residual, idx, use_sk=is_last_layer)
             residual = residual - x_res
             x_q = x_q + x_res
@@ -211,8 +215,12 @@ class ResidualVectorQuantizer(nn.Module):
         mean_losses = torch.stack(all_losses).mean()
         all_indices = torch.stack(all_indices, dim=-1)
         all_distances = torch.stack(all_distances, dim=1)
+        quantization_context = {
+            "residuals": torch.stack(all_residuals, dim=1),
+            "codebooks": torch.stack(all_codebooks, dim=0),
+        }
 
-        return x_q, mean_losses, all_indices, all_distances
+        return x_q, mean_losses, all_indices, all_distances, quantization_context
 
 class VectorQuantizer(nn.Module):
     def __init__(self, n_e, e_dim, mu=0.25,

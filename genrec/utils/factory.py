@@ -3,6 +3,7 @@
 from genrec.utils.models_setup.tiger_setup import create_tiger_model
 from genrec.utils.models_setup.letter_setup import create_letter_model
 from genrec.utils.models_setup.twmtl_setup import create_twmtl_letter_model, create_twmtl_tiger_model
+from genrec.utils.models_setup.care_setup import create_care_letter_model, create_care_tiger_model
 
 from genrec.data.datasets.generative.tiger_dataset import TigerDataset
 from genrec.data.collators.generative.tiger_collator import TigerDataCollator
@@ -15,6 +16,8 @@ MODEL_FACTORY = {
     "letter": create_letter_model,
     "tiger_twmtl": create_twmtl_tiger_model,
     "letter_twmtl": create_twmtl_letter_model,
+    "tiger_care": create_care_tiger_model,
+    "letter_care": create_care_letter_model,
 }
 
 DATASET_MAP = {
@@ -22,6 +25,8 @@ DATASET_MAP = {
     "letter": TigerDataset,
     "tiger_twmtl": TigerDataset,
     "letter_twmtl": TigerDataset,
+    "tiger_care": TigerDataset,
+    "letter_care": TigerDataset,
 }
 
 COLLATOR_MAP = {
@@ -29,6 +34,8 @@ COLLATOR_MAP = {
     "letter": TigerDataCollator,
     "tiger_twmtl": TigerDataCollator,
     "letter_twmtl": TigerDataCollator,
+    "tiger_care": TigerDataCollator,
+    "letter_care": TigerDataCollator,
 }
 
 PIPELINE_MAP = {

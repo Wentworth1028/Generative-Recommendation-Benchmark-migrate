@@ -29,3 +29,6 @@ early_stop_upper_steps: 5
 evaluation_epoch: 1
 use_user_tokens: false
 tau: 1.0
+care_sid_length: 4
+care_query_numbers: [1, 1, 4, 4]
+care_alpha: 0.7

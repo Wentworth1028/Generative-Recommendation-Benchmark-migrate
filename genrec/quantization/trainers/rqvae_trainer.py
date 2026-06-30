@@ -30,6 +30,13 @@ class RQVAETrainer:
         self.popularity_balance_schedule = self.config.get('popularity_balance_schedule', 'constant').lower()
         self.popularity_balance_start_epoch = int(self.config.get('popularity_balance_start_epoch', 0))
         self.popularity_balance_warmup_epochs = int(self.config.get('popularity_balance_warmup_epochs', 0))
+        self.popularity_balance_log_distribution = self._as_bool(
+            self.config.get('popularity_balance_log_distribution', False)
+        )
+        self.popularity_balance_distribution_interval = max(
+            1,
+            int(self.config.get('popularity_balance_distribution_interval', 100) or 100),
+        )
         self.tensorboard_enabled = self._as_bool(self.config.get('tensorboard_enabled', False))
         self.tensorboard_dir = self.config.get('tensorboard_dir')
         if not self.tensorboard_dir:
@@ -71,6 +78,11 @@ class RQVAETrainer:
     def _rq_loss_without_pop(self, recon_loss: float, commit_loss: float) -> float:
         return recon_loss + self._quant_loss_weight() * commit_loss
 
+    def _popularity_balance_entropy_gap(self, popularity_balance_loss: float) -> float:
+        if not hasattr(self.optimizer, 'popularity_balance_entropy_floor'):
+            return 0.0
+        return popularity_balance_loss - float(self.optimizer.popularity_balance_entropy_floor())
+
     def _init_training_trace(self):
         if self.accelerator is not None and not self.accelerator.is_main_process:
             return
@@ -95,6 +107,8 @@ class RQVAETrainer:
         train_commit: float,
         train_pop_balance: float,
         effective_popularity_weight: float,
+        distribution_scalars: dict[str, float] | None = None,
+        distribution_histograms: dict[str, torch.Tensor] | None = None,
     ):
         if self.accelerator is not None and not self.accelerator.is_main_process:
             return
@@ -109,6 +123,8 @@ class RQVAETrainer:
             train_pop_balance,
             weighted_pop_balance,
             effective_popularity_weight,
+            distribution_scalars=distribution_scalars,
+            distribution_histograms=distribution_histograms,
         )
 
     def _append_tensorboard_scalars(
@@ -121,6 +137,8 @@ class RQVAETrainer:
         train_pop_balance: float,
         weighted_pop_balance: float,
         effective_popularity_weight: float,
+        distribution_scalars: dict[str, float] | None = None,
+        distribution_histograms: dict[str, torch.Tensor] | None = None,
     ):
         if self.summary_writer is None:
             return
@@ -131,6 +149,11 @@ class RQVAETrainer:
         self.summary_writer.add_scalar("rqvae/quant_loss_weight", self._quant_loss_weight(), epoch)
         self.summary_writer.add_scalar("rqvae/popularity_balance_loss", train_pop_balance, epoch)
         self.summary_writer.add_scalar(
+            "rqvae/popularity_balance_entropy_gap",
+            self._popularity_balance_entropy_gap(train_pop_balance),
+            epoch,
+        )
+        self.summary_writer.add_scalar(
             "rqvae/weighted_popularity_balance_loss",
             weighted_pop_balance,
             epoch,
@@ -140,10 +163,40 @@ class RQVAETrainer:
             effective_popularity_weight,
             epoch,
         )
+        if distribution_scalars:
+            prefix = "rqvae/popularity_distribution"
+            for name, value in distribution_scalars.items():
+                self.summary_writer.add_scalar(f"{prefix}/{name}", value, epoch)
+        if distribution_histograms:
+            prefix = "rqvae/popularity_distribution"
+            for name, values in distribution_histograms.items():
+                self.summary_writer.add_histogram(f"{prefix}/{name}", values, epoch)
+        self.summary_writer.flush()
+
+    def _append_codebook_tensorboard_scalars(
+        self,
+        epoch: int,
+        utilization_rates: list[float],
+        avg_utilization: float,
+        collision_rate: float,
+    ):
+        if self.summary_writer is None:
+            return
+        self.summary_writer.add_scalar("rqvae/codebook_avg_utilization", avg_utilization, epoch)
+        self.summary_writer.add_scalar("rqvae/collision_rate", collision_rate, epoch)
+        for layer_idx, utilization_rate in enumerate(utilization_rates):
+            self.summary_writer.add_scalar(
+                f"rqvae/codebook_utilization/layer_{layer_idx}",
+                utilization_rate,
+                epoch,
+            )
         self.summary_writer.flush()
 
     def _batch_popularity_weights(self, item_ids):
-        if self.popularity_balance_weight <= 0.0:
+        if (
+            self.target_popularity_balance_weight <= 0.0
+            and not self.popularity_balance_log_distribution
+        ):
             return None
         if torch.is_tensor(item_ids):
             item_ids = item_ids.detach().cpu().tolist()
@@ -173,6 +226,14 @@ class RQVAETrainer:
         self.popularity_balance_weight = weight
         if hasattr(self.optimizer, 'popularity_balance_weight'):
             self.optimizer.popularity_balance_weight = weight
+
+    @staticmethod
+    def _average_metrics(totals: dict[str, float], count: int) -> dict[str, float]:
+        if count <= 0:
+            return {}
+        metrics = {key: value / count for key, value in totals.items()}
+        metrics["sampled_batches"] = float(count)
+        return metrics
 
     def _calculate_codebook_utilization(self, train_dataloader, log_output=True):
         self.tokenizer.eval()
@@ -245,6 +306,9 @@ class RQVAETrainer:
     def _train_one_epoch(self, train_dataloader, epoch: int):
         self.tokenizer.train()
         total_loss, total_recon_loss, total_commit_loss, total_popularity_balance_loss = 0.0, 0.0, 0.0, 0.0
+        distribution_totals: dict[str, float] = {}
+        distribution_count = 0
+        distribution_histograms: dict[str, torch.Tensor] = {}
         is_main = self.accelerator is None or self.accelerator.is_main_process
         progress_bar = tqdm(
             train_dataloader,
@@ -262,6 +326,24 @@ class RQVAETrainer:
                 tokenizer_output,
                 popularity_weights=popularity_weights,
             )
+            if (
+                self.popularity_balance_log_distribution
+                and step % self.popularity_balance_distribution_interval == 0
+                and hasattr(self.optimizer, "compute_popularity_distribution_metrics")
+            ):
+                distribution_metrics = self.optimizer.compute_popularity_distribution_metrics(
+                    tokenizer_output,
+                    popularity_weights=popularity_weights,
+                )
+                if distribution_metrics:
+                    scalars = distribution_metrics.get("scalars", {})
+                    histograms = distribution_metrics.get("histograms", {})
+                    if scalars:
+                        distribution_count += 1
+                        for key, value in scalars.items():
+                            distribution_totals[key] = distribution_totals.get(key, 0.0) + float(value)
+                    if histograms:
+                        distribution_histograms = histograms
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
@@ -287,6 +369,8 @@ class RQVAETrainer:
             total_recon_loss / len(train_dataloader),
             total_commit_loss / len(train_dataloader),
             total_popularity_balance_loss / len(train_dataloader),
+            self._average_metrics(distribution_totals, distribution_count),
+            distribution_histograms,
         )
 
     def _save_checkpoint(self, epoch, metric_value=None, is_best=False, utilization_rate=None, collision_rate=None):
@@ -330,25 +414,45 @@ class RQVAETrainer:
         if is_main:
             self._init_training_trace()
         for epoch in range(self.epochs):
-            effective_popularity_weight = self._scheduled_popularity_balance_weight(epoch)
-            self._set_popularity_balance_weight(effective_popularity_weight)
-            train_loss, train_recon, train_commit, train_pop_balance = self._train_one_epoch(train_dataloader, epoch)
+            scheduled_popularity_weight = self._scheduled_popularity_balance_weight(epoch)
+            self._set_popularity_balance_weight(scheduled_popularity_weight)
+            (
+                train_loss,
+                train_recon,
+                train_commit,
+                train_pop_balance,
+                distribution_scalars,
+                distribution_histograms,
+            ) = self._train_one_epoch(train_dataloader, epoch)
             if is_main:
                 rq_loss_without_pop = self._rq_loss_without_pop(train_recon, train_commit)
-                weighted_pop_balance = effective_popularity_weight * train_pop_balance
+                weighted_pop_balance = scheduled_popularity_weight * train_pop_balance
                 logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.8e} | "
                             f"RQ Loss Without Pop: {rq_loss_without_pop:.8e} | "
                             f"Train Recon Loss: {train_recon:.8e} | Train Commit Loss: {train_commit:.8e} | "
                             f"Train Popularity Balance Loss: {train_pop_balance:.8e} | "
+                            f"Popularity Balance Entropy Gap: {self._popularity_balance_entropy_gap(train_pop_balance):.8e} | "
                             f"Weighted Popularity Balance Loss: {weighted_pop_balance:.8e} | "
-                            f"Popularity Balance Weight: {effective_popularity_weight:.8e}")
+                            f"Popularity Balance Weight: {scheduled_popularity_weight:.8e}")
+                if distribution_scalars:
+                    logging.info(
+                        "Popularity Distribution | "
+                        f"Mean Effective Tokens: {distribution_scalars.get('mean/effective_tokens', 0.0):.4f} | "
+                        f"Mean P Max: {distribution_scalars.get('mean/p_max', 0.0):.8e} | "
+                        f"Mean Top10 Share: {distribution_scalars.get('mean/top10_share', 0.0):.8e} | "
+                        f"Mean Entropy Gap To Support: "
+                        f"{distribution_scalars.get('mean/entropy_gap_to_support', 0.0):.8e} | "
+                        f"Mean Candidate Support: {distribution_scalars.get('mean/candidate_support', 0.0):.2f}"
+                    )
                 self._append_training_trace(
                     epoch,
                     train_loss,
                     train_recon,
                     train_commit,
                     train_pop_balance,
-                    effective_popularity_weight,
+                    scheduled_popularity_weight,
+                    distribution_scalars=distribution_scalars,
+                    distribution_histograms=distribution_histograms,
                 )
 
             if (epoch + 1) % 1000 == 0:
@@ -360,8 +464,15 @@ class RQVAETrainer:
                     logging.info("=" * 60)
 
             if (epoch + 1) % self.save_interval == 0:
-                _, avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=False)
+                utilization_rates, avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=False)
                 collision_rate = self._calculate_collision_rate(valid_dataloader, log_output=False)
+                if is_main:
+                    self._append_codebook_tensorboard_scalars(
+                        epoch + 1,
+                        utilization_rates,
+                        avg_utilization,
+                        collision_rate,
+                    )
                 
                 if self.save_best_on == 'utilization':
                     comparable_metric = avg_utilization
@@ -380,9 +491,15 @@ class RQVAETrainer:
                 self._save_checkpoint(epoch, utilization_rate=avg_utilization, collision_rate=collision_rate) 
         if is_main:                
             logging.info("\n=== Final Metrics Analysis ===")
-        _, final_avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=True)
+        final_utilization_rates, final_avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=True)
         final_collision_rate = self._calculate_collision_rate(valid_dataloader, log_output=True)
         if is_main:
+            self._append_codebook_tensorboard_scalars(
+                self.epochs,
+                final_utilization_rates,
+                final_avg_utilization,
+                final_collision_rate,
+            )
             logging.info("=" * 60)
         
         self._save_checkpoint(self.epochs - 1, utilization_rate=final_avg_utilization, collision_rate=final_collision_rate)

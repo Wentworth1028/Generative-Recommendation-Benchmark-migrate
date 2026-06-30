@@ -1,0 +1,5 @@
+# config/generative/tiger_care.yaml
+type: "tiger_care"
+trainer:
+  _target_: genrec.trainers.generative.tiger_trainer.TigerTrainer
+  _partial_: true

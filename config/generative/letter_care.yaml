@@ -1,0 +1,5 @@
+# config/generative/letter_care.yaml
+type: "letter_care"
+trainer:
+  _target_: genrec.trainers.generative.tiger_trainer.TigerTrainer
+  _partial_: true

@@ -96,6 +96,25 @@ class LETTERRQVAETrainer:
         self.summary_writer.add_scalar("letter/cf_loss", train_cf, epoch)
         self.summary_writer.flush()
 
+    def _append_codebook_tensorboard_scalars(
+        self,
+        epoch: int,
+        utilization_rates: list[float],
+        avg_utilization: float,
+        collision_rate: float,
+    ):
+        if self.summary_writer is None:
+            return
+        self.summary_writer.add_scalar("letter/codebook_avg_utilization", avg_utilization, epoch)
+        self.summary_writer.add_scalar("letter/collision_rate", collision_rate, epoch)
+        for layer_idx, utilization_rate in enumerate(utilization_rates):
+            self.summary_writer.add_scalar(
+                f"letter/codebook_utilization/layer_{layer_idx}",
+                utilization_rate,
+                epoch,
+            )
+        self.summary_writer.flush()
+
     def _calculate_codebook_utilization(self, train_dataloader, log_output=True):
         self.tokenizer.eval()
         
@@ -266,8 +285,15 @@ class LETTERRQVAETrainer:
                     logging.info("=" * 60)
 
             if (epoch + 1) % self.save_interval == 0:
-                _, avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=False)
+                utilization_rates, avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=False)
                 collision_rate = self._calculate_collision_rate(valid_dataloader, log_output=False)
+                if is_main:
+                    self._append_codebook_tensorboard_scalars(
+                        epoch + 1,
+                        utilization_rates,
+                        avg_utilization,
+                        collision_rate,
+                    )
                 
                 if self.save_best_on == 'utilization':
                     comparable_metric = avg_utilization
@@ -286,9 +312,15 @@ class LETTERRQVAETrainer:
                 self._save_checkpoint(epoch, utilization_rate=avg_utilization, collision_rate=collision_rate) 
         if is_main:               
             logging.info("\n=== Final Metrics Analysis ===")
-        _, final_avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=True)
+        final_utilization_rates, final_avg_utilization = self._calculate_codebook_utilization(valid_dataloader, log_output=True)
         final_collision_rate = self._calculate_collision_rate(valid_dataloader, log_output=True)
         if is_main:
+            self._append_codebook_tensorboard_scalars(
+                self.epochs,
+                final_utilization_rates,
+                final_avg_utilization,
+                final_collision_rate,
+            )
             logging.info("=" * 60)
         
         self._save_checkpoint(self.epochs - 1, utilization_rate=final_avg_utilization, collision_rate=final_collision_rate)

@@ -15,10 +15,15 @@ popularity_balance_schedule: "constant"
 popularity_balance_start_epoch: 0
 popularity_balance_warmup_epochs: 0
 popularity_softmax_temperature: 1.0
-popularity_weight_transform: "log1p"
+popularity_weight_transform: "nominal"
+popularity_nominal_gamma: 0.5
+popularity_nominal_clip_quantile: 0.995
+popularity_nominal_clip_value: null
 popularity_balance_eps: 1e-8
 popularity_balance_disabled_layers: []
 popularity_balance_top_k: 0
+popularity_balance_log_distribution: false
+popularity_balance_distribution_interval: 100
 commitment_beta: 0.25
 rq_kmeans_init: true
 kmeans_iters: 10
