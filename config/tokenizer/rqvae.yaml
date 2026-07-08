@@ -11,6 +11,7 @@ dropout_prob: 0
 loss_type: "mse"
 quant_loss_weight: 0.25
 popularity_balance_weight: 0.0
+popularity_balance_mode: "batch_entropy"
 popularity_balance_schedule: "constant"
 popularity_balance_start_epoch: 0
 popularity_balance_warmup_epochs: 0
@@ -21,9 +22,13 @@ popularity_nominal_clip_quantile: 0.995
 popularity_nominal_clip_value: null
 popularity_balance_eps: 1e-8
 popularity_balance_disabled_layers: []
+popularity_balance_layer_weights: []
 popularity_balance_top_k: 0
 popularity_balance_log_distribution: false
 popularity_balance_distribution_interval: 100
+popularity_ema_half_life_epochs: 1.0
+popularity_ema_half_life_items: null
+popularity_ema_normalize_item_weights: true
 commitment_beta: 0.25
 rq_kmeans_init: true
 kmeans_iters: 10

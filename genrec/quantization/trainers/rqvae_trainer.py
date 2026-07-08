@@ -81,6 +81,8 @@ class RQVAETrainer:
     def _popularity_balance_entropy_gap(self, popularity_balance_loss: float) -> float:
         if not hasattr(self.optimizer, 'popularity_balance_entropy_floor'):
             return 0.0
+        if getattr(self.optimizer, 'popularity_balance_mode', 'batch_entropy') != 'batch_entropy':
+            return 0.0
         return popularity_balance_loss - float(self.optimizer.popularity_balance_entropy_floor())
 
     def _init_training_trace(self):
@@ -227,6 +229,23 @@ class RQVAETrainer:
         if hasattr(self.optimizer, 'popularity_balance_weight'):
             self.optimizer.popularity_balance_weight = weight
 
+    def _apply_popularity_ema_update(self):
+        if not hasattr(self.optimizer, 'pop_pending_ema_observation'):
+            return
+        observation, item_count = self.optimizer.pop_pending_ema_observation()
+        if observation is None or item_count <= 0:
+            return
+
+        with torch.no_grad():
+            count_tensor = observation.new_tensor(float(item_count))
+            weighted_observation = observation * count_tensor
+            if self.accelerator is not None:
+                weighted_observation = self.accelerator.reduce(weighted_observation, reduction="sum")
+                count_tensor = self.accelerator.reduce(count_tensor, reduction="sum")
+            global_count = int(count_tensor.item())
+            mean_observation = weighted_observation / count_tensor.clamp_min(1.0)
+            self.optimizer.apply_popularity_ema_update(mean_observation, global_count)
+
     @staticmethod
     def _average_metrics(totals: dict[str, float], count: int) -> dict[str, float]:
         if count <= 0:
@@ -346,6 +365,7 @@ class RQVAETrainer:
                         distribution_histograms = histograms
             loss.backward()
             self.optimizer.step()
+            self._apply_popularity_ema_update()
             total_loss += loss.item()
             total_recon_loss += reconstruction_loss.item()
             total_commit_loss += commit_loss.item()
