@@ -132,11 +132,12 @@ class BaseGenerativeTrainer(Trainer):
             unwrapped_model = self.accelerator.unwrap_model(model)
         else:
             unwrapped_model = model
-        if self.inference_mode == "FastCBS":
+        logits_processor = getattr(self, "processors", None)
+        if logits_processor is not None:
             generated_sequences = unwrapped_model.generate(
                 input_ids=encoder_input_ids,
                 attention_mask=encoder_attention_mask,
-                logits_processor=self.processors,
+                logits_processor=logits_processor,
                 **gen_kwargs,
             )
         else:

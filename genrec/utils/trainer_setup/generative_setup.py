@@ -1,6 +1,7 @@
 # genrec/utils/trainer_setup/generative/generative_setup.py
 
 from typing import Optional, Dict, List
+from collections import Counter
 from functools import partial
 from transformers import TrainingArguments, EarlyStoppingCallback
 from hydra.utils import instantiate
@@ -12,6 +13,15 @@ from genrec.utils.callbacks.generative.generative_callback import (
     EvaluateEveryNEpochsCallback,
     DelayedEvaluateEveryNEpochsCallback,
 )
+
+
+def compute_train_target_item_popularity(train_dataset) -> Dict[int, int]:
+    counter = Counter()
+    for sample in getattr(train_dataset, "samples", []):
+        target_item = sample.get("target_item")
+        if target_item is not None:
+            counter[int(target_item)] += 1
+    return dict(counter)
 
 
 def setup_training(
@@ -61,7 +71,17 @@ def setup_training(
     k_list = model_config.get('k_list', [5, 10, 20])
     max_k = k_list[-1] if k_list else 10
 
-    generation_params = {'max_gen_length': max_gen_length, 'num_beams': num_beams, 'max_k': max_k}
+    generation_params = {
+        'max_gen_length': max_gen_length,
+        'num_beams': num_beams,
+        'max_k': max_k,
+        'prefix_popularity_penalty': model_config.get('prefix_popularity_penalty', 0.0),
+        'prefix_popularity_transform': model_config.get('prefix_popularity_transform', 'log1p'),
+        'prefix_popularity_positive_only': model_config.get('prefix_popularity_positive_only', True),
+        'prefix_popularity_max_length': model_config.get('prefix_popularity_max_length', None),
+        'prefix_popularity_eps': model_config.get('prefix_popularity_eps', 1e-8),
+    }
+    item_popularity = compute_train_target_item_popularity(train_dataset)
 
     # ===== CallBacks =====
     callbacks = [
@@ -87,6 +107,7 @@ def setup_training(
         eos_token_id=tokenizer.eos_token,
         vocab_size=vocab_size,
         inference_mode=model_config["inference_mode"],
+        item_popularity=item_popularity,
     )
 
     return trainer

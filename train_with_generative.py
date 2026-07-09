@@ -117,6 +117,7 @@ def stage2_train_generation_model(
         logger.info(f"   - Num Epochs:    {model_config.get('num_epochs')}")
         logger.info(f"   - Seed:          {model_config.get('seed')}")
         logger.info(f"   - Inference:     {model_config.get('inference_mode')}")
+        logger.info(f"   - Prefix Penalty:{model_config.get('prefix_popularity_penalty', 0.0)}")
         logger.info("-" * 40)
     if accelerator.is_main_process:
         logger.info(f"loading Tokenizer...")

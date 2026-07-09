@@ -23,6 +23,11 @@ use_generative: true
 num_beams: 10
 inference_mode: "FastCBS"
 max_gen_length: 5
+prefix_popularity_penalty: 0.0
+prefix_popularity_transform: log1p
+prefix_popularity_positive_only: true
+prefix_popularity_max_length: null
+prefix_popularity_eps: 1e-8
 weight_decay: 0.2
 warmup_ratio: 0.05
 early_stop_upper_steps: 5
