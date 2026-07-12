@@ -30,13 +30,18 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self.popularity_balance_log_distribution = self._as_bool(
             self.config.get('popularity_balance_log_distribution', False)
         )
+        self.popularity_prefix_balance_enabled = self._as_bool(
+            self.config.get('popularity_prefix_balance_enabled', False)
+        )
         self.popularity_ema_half_life_epochs = float(self.config.get('popularity_ema_half_life_epochs', 1.0))
         self.popularity_ema_half_life_items = self._resolve_ema_half_life_items()
         self.popularity_ema_normalize_item_weights = self._as_bool(
             self.config.get('popularity_ema_normalize_item_weights', True)
         )
         self.popularity_ema_mass: torch.Tensor | None = None
+        self.popularity_prefix_ema_mass: dict[int, torch.Tensor] = {}
         self._pending_popularity_ema_observation: torch.Tensor | None = None
+        self._pending_popularity_prefix_ema_observation: dict[int, torch.Tensor] | None = None
         self._pending_popularity_ema_count = 0
         self._last_popularity_layer_loss: torch.Tensor | None = None
         self._last_popularity_layer_enabled_mask: torch.Tensor | None = None
@@ -344,11 +349,168 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         mass = self.popularity_ema_mass
         return mass / mass.sum(dim=-1, keepdim=True).clamp_min(self.popularity_balance_eps)
 
+    def _prefix_depths(self, n_layers: int, device: torch.device) -> list[int]:
+        layer_weights = self._layer_weight_tensor(n_layers, device=device, dtype=torch.float32)
+        return [
+            depth
+            for depth in range(2, n_layers + 1)
+            if layer_weights[depth - 1].item() > 0.0
+        ]
+
+    def _ensure_popularity_prefix_ema_mass(
+        self,
+        depth: int,
+        codebook_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        num_prefixes = codebook_size ** depth
+        mass = self.popularity_prefix_ema_mass.get(depth)
+        if (
+            mass is None
+            or mass.numel() != num_prefixes
+            or mass.device != device
+            or mass.dtype != dtype
+        ):
+            mass = torch.full(
+                (num_prefixes,),
+                1.0 / float(num_prefixes),
+                device=device,
+                dtype=dtype,
+            )
+            self.popularity_prefix_ema_mass[depth] = mass
+        return mass
+
+    def _popularity_prefix_ema_distribution(
+        self,
+        depth: int,
+        codebook_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        mass = self._ensure_popularity_prefix_ema_mass(depth, codebook_size, device, dtype)
+        return mass / mass.sum().clamp_min(self.popularity_balance_eps)
+
+    def _compute_prefix_ema_item_popularity_balance_loss(
+        self,
+        residuals: torch.Tensor | None,
+        codebooks: torch.Tensor,
+        item_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            not self.popularity_prefix_balance_enabled
+            or residuals is None
+            or self.popularity_balance_top_k <= 0
+        ):
+            return codebooks.new_tensor(0.0)
+
+        n_layers = min(residuals.size(1), codebooks.size(0))
+        prefix_depths = self._prefix_depths(n_layers, device=codebooks.device)
+        if not prefix_depths:
+            return codebooks.new_tensor(0.0)
+
+        batch_size = residuals.size(0)
+        codebook_size = codebooks.size(1)
+        beam_width = min(max(1, self.popularity_balance_top_k), codebook_size)
+        temperature = max(self.popularity_softmax_temperature, self.popularity_balance_eps)
+        distance_scales = self._codebook_squared_l2_scale(codebooks).to(
+            device=codebooks.device,
+            dtype=codebooks.dtype,
+        )
+
+        latent = residuals[:, 0, :]
+        first_distances = ((latent.unsqueeze(1) - codebooks[0].unsqueeze(0)) ** 2).sum(dim=-1)
+        first_logits = -(first_distances / distance_scales[0]) / temperature
+        _, first_indices = torch.topk(first_distances.detach(), k=beam_width, dim=-1, largest=False)
+        first_probs = torch.softmax(first_logits.gather(dim=-1, index=first_indices), dim=-1)
+
+        beam_keys = first_indices
+        beam_scores = first_probs
+        first_code_vectors = codebooks[0].index_select(0, first_indices.reshape(-1)).view(
+            batch_size,
+            beam_width,
+            -1,
+        )
+        beam_residuals = latent.unsqueeze(1) - first_code_vectors
+
+        prefix_losses = []
+        prefix_observations: dict[int, torch.Tensor] = {}
+        max_depth = max(prefix_depths)
+
+        for layer_idx in range(1, max_depth):
+            current_codebook = codebooks[layer_idx]
+            child_distances = (
+                (beam_residuals.unsqueeze(2) - current_codebook.view(1, 1, codebook_size, -1)) ** 2
+            ).sum(dim=-1)
+            child_logits = -(child_distances / distance_scales[layer_idx]) / temperature
+            _, child_indices = torch.topk(child_distances.detach(), k=beam_width, dim=-1, largest=False)
+            child_probs = torch.softmax(child_logits.gather(dim=-1, index=child_indices), dim=-1)
+
+            candidate_scores = beam_scores.unsqueeze(-1) * child_probs
+            flat_scores = candidate_scores.reshape(batch_size, -1)
+            kept_scores, kept_flat_indices = torch.topk(flat_scores, k=beam_width, dim=-1, largest=True)
+
+            flat_child_indices = child_indices.reshape(batch_size, -1)
+            selected_children = flat_child_indices.gather(dim=-1, index=kept_flat_indices)
+            parent_slot = kept_flat_indices.div(beam_width, rounding_mode='floor')
+            parent_keys = beam_keys.gather(dim=-1, index=parent_slot)
+            beam_keys = parent_keys * codebook_size + selected_children
+            beam_scores = kept_scores / kept_scores.sum(dim=-1, keepdim=True).clamp_min(self.popularity_balance_eps)
+
+            parent_residuals = beam_residuals.gather(
+                dim=1,
+                index=parent_slot.unsqueeze(-1).expand(-1, -1, beam_residuals.size(-1)),
+            )
+            selected_code_vectors = current_codebook.index_select(0, selected_children.reshape(-1)).view(
+                batch_size,
+                beam_width,
+                -1,
+            )
+            beam_residuals = parent_residuals - selected_code_vectors
+
+            depth = layer_idx + 1
+            if depth not in prefix_depths:
+                continue
+
+            prefix_distribution = self._popularity_prefix_ema_distribution(
+                depth,
+                codebook_size,
+                device=codebooks.device,
+                dtype=codebooks.dtype,
+            ).detach()
+            uniform = codebooks.new_tensor(1.0 / float(codebook_size ** depth))
+            prefix_bias = torch.log(
+                (prefix_distribution + self.popularity_balance_eps)
+                / (uniform + self.popularity_balance_eps)
+            )
+            selected_bias = prefix_bias.gather(dim=0, index=beam_keys.reshape(-1)).view(batch_size, beam_width)
+            item_prefix_loss = (beam_scores * selected_bias * item_weights.view(-1, 1)).sum(dim=-1)
+            prefix_losses.append((depth, item_prefix_loss.mean()))
+
+            observation = codebooks.new_zeros(codebook_size ** depth)
+            weighted_scores = (beam_scores.detach() * item_weights.detach().view(-1, 1)).reshape(-1)
+            observation.scatter_add_(dim=0, index=beam_keys.detach().reshape(-1), src=weighted_scores)
+            prefix_observations[depth] = observation / float(batch_size)
+
+        self._pending_popularity_prefix_ema_observation = prefix_observations or None
+        if not prefix_losses:
+            return codebooks.new_tensor(0.0)
+
+        layer_weights = self._layer_weight_tensor(n_layers, device=codebooks.device, dtype=codebooks.dtype)
+        weighted_loss = codebooks.new_tensor(0.0)
+        weight_sum = codebooks.new_tensor(0.0)
+        for depth, prefix_loss in prefix_losses:
+            weight = layer_weights[depth - 1]
+            weighted_loss = weighted_loss + prefix_loss * weight
+            weight_sum = weight_sum + weight
+        return weighted_loss / weight_sum.clamp_min(self.popularity_balance_eps)
+
     def _compute_ema_item_popularity_balance_loss(
         self,
         distances: torch.Tensor,
         popularity_weights: torch.Tensor,
         codebooks: torch.Tensor,
+        residuals: torch.Tensor | None = None,
     ):
         temperature = max(self.popularity_softmax_temperature, self.popularity_balance_eps)
         normalized_distances = self._normalize_popularity_distances(distances, codebooks)
@@ -380,13 +542,19 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self._pending_popularity_ema_observation = observation.detach()
         self._pending_popularity_ema_count = int(distances.size(0))
 
-        return loss
+        prefix_loss = self._compute_prefix_ema_item_popularity_balance_loss(
+            residuals,
+            codebooks,
+            item_weights,
+        )
+        return loss + prefix_loss
 
     def _compute_popularity_balance_loss(
         self,
         distances: torch.Tensor,
         popularity_weights: torch.Tensor,
         codebooks: torch.Tensor,
+        residuals: torch.Tensor | None = None,
     ):
         if distances is None or popularity_weights is None:
             return distances.new_tensor(0.0) if distances is not None else torch.tensor(0.0)
@@ -399,6 +567,7 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
                 distances,
                 popularity_weights,
                 codebooks,
+                residuals=residuals,
             )
         return self._compute_batch_entropy_popularity_balance_loss(
             distances,
@@ -406,29 +575,59 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
             codebooks,
         )
 
-    def pop_pending_ema_observation(self) -> tuple[torch.Tensor | None, int]:
+    def pop_pending_ema_observation(self):
+        if self._pending_popularity_prefix_ema_observation:
+            return {
+                "token": self._pending_popularity_ema_observation,
+                "prefix": self._pending_popularity_prefix_ema_observation,
+            }, self._pending_popularity_ema_count
         return self._pending_popularity_ema_observation, self._pending_popularity_ema_count
 
     def clear_pending_popularity_ema_observation(self):
         self._pending_popularity_ema_observation = None
+        self._pending_popularity_prefix_ema_observation = None
         self._pending_popularity_ema_count = 0
 
-    def apply_popularity_ema_update(self, observation: torch.Tensor, item_count: int):
+    def apply_popularity_ema_update(self, observation, item_count: int):
         if self.popularity_balance_mode != 'ema_item' or observation is None or item_count <= 0:
             self.clear_pending_popularity_ema_observation()
             return
-        if self.popularity_ema_mass is None:
-            self.popularity_ema_mass = observation.detach().clone().clamp_min(0.0)
+        if isinstance(observation, dict):
+            token_observation = observation.get("token")
+            prefix_observation = observation.get("prefix") or {}
+        else:
+            token_observation = observation
+            prefix_observation = {}
+        if token_observation is None:
             self.clear_pending_popularity_ema_observation()
             return
-        observation = observation.to(
+        if self.popularity_ema_mass is None:
+            self.popularity_ema_mass = token_observation.detach().clone().clamp_min(0.0)
+        token_observation = token_observation.to(
             device=self.popularity_ema_mass.device,
             dtype=self.popularity_ema_mass.dtype,
         ).clamp_min(0.0)
         rho = 2.0 ** (-float(item_count) / max(self.popularity_ema_half_life_items, 1.0))
         with torch.no_grad():
-            self.popularity_ema_mass.mul_(rho).add_(observation, alpha=1.0 - rho)
+            self.popularity_ema_mass.mul_(rho).add_(token_observation, alpha=1.0 - rho)
             self.popularity_ema_mass.clamp_min_(0.0)
+            for depth, depth_observation in prefix_observation.items():
+                depth = int(depth)
+                if depth_observation is None:
+                    continue
+                depth_observation = depth_observation.detach().clamp_min(0.0)
+                prefix_mass = self.popularity_prefix_ema_mass.get(depth)
+                if (
+                    prefix_mass is None
+                    or prefix_mass.shape != depth_observation.shape
+                    or prefix_mass.device != depth_observation.device
+                    or prefix_mass.dtype != depth_observation.dtype
+                ):
+                    prefix_mass = depth_observation.clone()
+                    self.popularity_prefix_ema_mass[depth] = prefix_mass
+                else:
+                    prefix_mass.mul_(rho).add_(depth_observation, alpha=1.0 - rho)
+                    prefix_mass.clamp_min_(0.0)
         self.clear_pending_popularity_ema_observation()
 
     def compute_popularity_distribution_metrics(
@@ -632,6 +831,7 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         quantized_embeddings, _, commit_loss, distances = tokenizer_output[:4]
         quantization_context = tokenizer_output[4] if len(tokenizer_output) > 4 else {}
         codebooks = quantization_context.get("codebooks") if isinstance(quantization_context, dict) else None
+        residuals = quantization_context.get("residuals") if isinstance(quantization_context, dict) else None
 
         reconstruction_loss = F.mse_loss(quantized_embeddings, original_embeddings)
         if codebooks is None:
@@ -641,6 +841,7 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
                 distances,
                 popularity_weights,
                 codebooks,
+                residuals=residuals,
             )
         total_loss = (
             reconstruction_loss

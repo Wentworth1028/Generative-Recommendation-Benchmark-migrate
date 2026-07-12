@@ -236,14 +236,49 @@ class RQVAETrainer:
         if observation is None or item_count <= 0:
             return
 
-        with torch.no_grad():
-            count_tensor = observation.new_tensor(float(item_count))
-            weighted_observation = observation * count_tensor
+        def scale_observation(value, scale):
+            if isinstance(value, dict):
+                return {key: scale_observation(item, scale) for key, item in value.items()}
+            if value is None:
+                return None
+            return value * scale
+
+        def reduce_observation(value):
+            if isinstance(value, dict):
+                return {key: reduce_observation(item) for key, item in value.items()}
+            if value is None:
+                return None
             if self.accelerator is not None:
-                weighted_observation = self.accelerator.reduce(weighted_observation, reduction="sum")
+                return self.accelerator.reduce(value, reduction="sum")
+            return value
+
+        def divide_observation(value, denominator):
+            if isinstance(value, dict):
+                return {key: divide_observation(item, denominator) for key, item in value.items()}
+            if value is None:
+                return None
+            return value / denominator
+
+        def first_tensor(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    found = first_tensor(item)
+                    if found is not None:
+                        return found
+                return None
+            return value
+
+        with torch.no_grad():
+            reference_tensor = first_tensor(observation)
+            if reference_tensor is None:
+                return
+            count_tensor = reference_tensor.new_tensor(float(item_count))
+            weighted_observation = scale_observation(observation, count_tensor)
+            if self.accelerator is not None:
+                weighted_observation = reduce_observation(weighted_observation)
                 count_tensor = self.accelerator.reduce(count_tensor, reduction="sum")
             global_count = int(count_tensor.item())
-            mean_observation = weighted_observation / count_tensor.clamp_min(1.0)
+            mean_observation = divide_observation(weighted_observation, count_tensor.clamp_min(1.0))
             self.optimizer.apply_popularity_ema_update(mean_observation, global_count)
 
     @staticmethod

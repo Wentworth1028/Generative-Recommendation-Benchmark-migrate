@@ -24,6 +24,7 @@ popularity_balance_eps: 1e-8
 popularity_balance_disabled_layers: []
 popularity_balance_layer_weights: []
 popularity_balance_top_k: 0
+popularity_prefix_balance_enabled: false
 popularity_balance_log_distribution: false
 popularity_balance_distribution_interval: 100
 popularity_ema_half_life_epochs: 1.0
