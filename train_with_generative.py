@@ -26,6 +26,18 @@ from genrec.utils.popularity_metrics import (
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def has_saved_hf_model(model_dir: str) -> bool:
+    """Return true only when a complete-enough HF checkpoint exists."""
+    if not os.path.isdir(model_dir):
+        return False
+    has_config = os.path.exists(os.path.join(model_dir, "config.json"))
+    has_weights = any(
+        os.path.exists(os.path.join(model_dir, filename))
+        for filename in ("model.safetensors", "pytorch_model.bin")
+    )
+    return has_config and has_weights
+
+
 def setup_output_directories(base_output_dir: str = "./output"):
 
     if "NNI_PLATFORM" in os.environ:
@@ -96,7 +108,7 @@ def stage2_train_generation_model(
         logger.info("=" * 60)
 
     model_save_path = model_config['model_save_path']
-    do_inference_only = (not force_retrain) and os.path.exists(model_save_path)
+    do_inference_only = (not force_retrain) and has_saved_hf_model(model_save_path)
 
     if do_inference_only and accelerator.is_main_process:
         logger.info(f"found existing model_save_path: {model_save_path}")

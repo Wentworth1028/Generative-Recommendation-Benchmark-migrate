@@ -25,17 +25,17 @@ class RQVAETrainer:
         self.checkpoint_path = self.config.get('checkpoint_path')
         self.save_interval = self.config.get('save_interval')
         self.item_popularity = self.config.get('item_popularity', {})
-        self.popularity_balance_weight = float(self.config.get('popularity_balance_weight', 0.0))
+        self.popularity_balance_weight = float(self._config_get('balance_weight', 'popularity_balance_weight', 0.0))
         self.target_popularity_balance_weight = self.popularity_balance_weight
-        self.popularity_balance_schedule = self.config.get('popularity_balance_schedule', 'constant').lower()
-        self.popularity_balance_start_epoch = int(self.config.get('popularity_balance_start_epoch', 0))
-        self.popularity_balance_warmup_epochs = int(self.config.get('popularity_balance_warmup_epochs', 0))
+        self.popularity_balance_schedule = self._config_get('balance_schedule', 'popularity_balance_schedule', 'constant').lower()
+        self.popularity_balance_start_epoch = int(self._config_get('balance_start_epoch', 'popularity_balance_start_epoch', 0))
+        self.popularity_balance_warmup_epochs = int(self._config_get('balance_warmup_epochs', 'popularity_balance_warmup_epochs', 0))
         self.popularity_balance_log_distribution = self._as_bool(
-            self.config.get('popularity_balance_log_distribution', False)
+            self._config_get('log_distribution', 'popularity_balance_log_distribution', False)
         )
         self.popularity_balance_distribution_interval = max(
             1,
-            int(self.config.get('popularity_balance_distribution_interval', 100) or 100),
+            int(self._config_get('distribution_interval', 'popularity_balance_distribution_interval', 100) or 100),
         )
         self.tensorboard_enabled = self._as_bool(self.config.get('tensorboard_enabled', False))
         self.tensorboard_dir = self.config.get('tensorboard_dir')
@@ -71,6 +71,13 @@ class RQVAETrainer:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
+
+    def _config_get(self, key: str, legacy_key: str | None = None, default=None):
+        if key in self.config:
+            return self.config.get(key)
+        if legacy_key is not None and legacy_key in self.config:
+            return self.config.get(legacy_key)
+        return default
 
     def _quant_loss_weight(self) -> float:
         return float(getattr(self.optimizer, 'quant_loss_weight', self.config.get('quant_loss_weight', 1.0)))

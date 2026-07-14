@@ -10,33 +10,36 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self.tokenizer = tokenizer
 
         self.quant_loss_weight = self.config['quant_loss_weight']
-        self.popularity_balance_weight = float(self.config.get('popularity_balance_weight', 0.0))
-        self.popularity_balance_mode = str(self.config.get('popularity_balance_mode', 'batch_entropy')).lower()
+        self.popularity_balance_weight = float(self._config_get('balance_weight', 'popularity_balance_weight', 0.0))
+        self.popularity_balance_mode = str(self._config_get('balance_mode', 'popularity_balance_mode', 'batch_entropy')).lower()
         if self.popularity_balance_mode not in {'batch_entropy', 'ema_item'}:
             raise ValueError(
                 f"Unsupported popularity_balance_mode: {self.popularity_balance_mode}. "
                 "Expected 'batch_entropy' or 'ema_item'."
             )
-        self.popularity_softmax_temperature = float(self.config.get('popularity_softmax_temperature', 1.0))
-        self.popularity_weight_transform = str(self.config.get('popularity_weight_transform', 'nominal')).lower()
-        self.popularity_nominal_gamma = float(self.config.get('popularity_nominal_gamma', 0.5))
+        self.popularity_softmax_temperature = float(self._config_get('softmax_temperature', 'popularity_softmax_temperature', 1.0))
+        self.popularity_weight_transform = str(self._config_get('weight_transform', 'popularity_weight_transform', 'nominal')).lower()
+        self.popularity_nominal_gamma = float(self._config_get('nominal_gamma', 'popularity_nominal_gamma', 0.5))
         if self.popularity_nominal_gamma <= 0.0:
             raise ValueError("popularity_nominal_gamma must be positive.")
-        self.popularity_balance_eps = float(self.config.get('popularity_balance_eps', 1e-8))
+        self.popularity_balance_eps = float(self._config_get('balance_eps', 'popularity_balance_eps', 1e-8))
         self.popularity_nominal_clip_value = self._resolve_nominal_clip_value()
         self.popularity_nominal_denominator = self._compute_nominal_denominator()
         self.popularity_transformed_weight_mean = self._compute_transformed_popularity_mean()
-        self.popularity_balance_top_k = int(self.config.get('popularity_balance_top_k', 0) or 0)
+        self.popularity_balance_top_k = int(self._config_get('top_k', 'popularity_balance_top_k', 0) or 0)
         self.popularity_balance_log_distribution = self._as_bool(
-            self.config.get('popularity_balance_log_distribution', False)
+            self._config_get('log_distribution', 'popularity_balance_log_distribution', False)
+        )
+        self.token_balance_enabled = self._as_bool(
+            self._config_get('token_balance_enabled', 'popularity_token_balance_enabled', True)
         )
         self.popularity_prefix_balance_enabled = self._as_bool(
-            self.config.get('popularity_prefix_balance_enabled', False)
+            self._config_get('prefix_balance_enabled', 'popularity_prefix_balance_enabled', False)
         )
-        self.popularity_ema_half_life_epochs = float(self.config.get('popularity_ema_half_life_epochs', 1.0))
+        self.popularity_ema_half_life_epochs = float(self._config_get('ema_half_life_epochs', 'popularity_ema_half_life_epochs', 1.0))
         self.popularity_ema_half_life_items = self._resolve_ema_half_life_items()
         self.popularity_ema_normalize_item_weights = self._as_bool(
-            self.config.get('popularity_ema_normalize_item_weights', True)
+            self._config_get('ema_normalize_item_weights', 'popularity_ema_normalize_item_weights', True)
         )
         self.popularity_ema_mass: torch.Tensor | None = None
         self.popularity_prefix_ema_mass: dict[int, torch.Tensor] = {}
@@ -46,10 +49,10 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self._last_popularity_layer_loss: torch.Tensor | None = None
         self._last_popularity_layer_enabled_mask: torch.Tensor | None = None
         self.popularity_balance_disabled_layers = self._parse_disabled_layers(
-            self.config.get('popularity_balance_disabled_layers', [])
+            self._config_get('disabled_layers', 'popularity_balance_disabled_layers', [])
         )
         self.popularity_balance_layer_weights = self._parse_layer_weights(
-            self.config.get('popularity_balance_layer_weights', [])
+            self._config_get('layer_weights', 'popularity_balance_layer_weights', [])
         )
         learning_rate = self.config['learning_rate']
 
@@ -84,6 +87,13 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
 
+    def _config_get(self, key: str, legacy_key: str | None = None, default=None):
+        if key in self.config:
+            return self.config.get(key)
+        if legacy_key is not None and legacy_key in self.config:
+            return self.config.get(legacy_key)
+        return default
+
     def zero_grad(self):
         self.torch_optimizer.zero_grad()
 
@@ -103,11 +113,11 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         return float(value)
 
     def _resolve_nominal_clip_value(self):
-        explicit_clip = self._optional_float(self.config.get('popularity_nominal_clip_value'))
+        explicit_clip = self._optional_float(self._config_get('nominal_clip_value', 'popularity_nominal_clip_value'))
         if explicit_clip is not None:
             return max(0.0, explicit_clip)
 
-        clip_quantile = self._optional_float(self.config.get('popularity_nominal_clip_quantile', 0.995))
+        clip_quantile = self._optional_float(self._config_get('nominal_clip_quantile', 'popularity_nominal_clip_quantile', 0.995))
         if clip_quantile is None or clip_quantile <= 0.0 or clip_quantile >= 1.0:
             return None
 
@@ -134,7 +144,7 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         return float(transformed.mean().clamp_min(self.popularity_balance_eps).item())
 
     def _resolve_ema_half_life_items(self) -> float:
-        explicit_items = self._optional_float(self.config.get('popularity_ema_half_life_items'))
+        explicit_items = self._optional_float(self._config_get('ema_half_life_items', 'popularity_ema_half_life_items'))
         if explicit_items is not None and explicit_items > 0.0:
             return explicit_items
         item_count = max(1, len(self.config.get('item_popularity', {})))
@@ -531,7 +541,10 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         enabled_mask = self._enabled_layer_mask(layer_loss.size(0), layer_loss.device)
         self._last_popularity_layer_loss = layer_loss.detach()
         self._last_popularity_layer_enabled_mask = enabled_mask.detach()
-        loss = self._weighted_layer_mean(layer_loss)
+        if self.token_balance_enabled:
+            loss = self._weighted_layer_mean(layer_loss)
+        else:
+            loss = distances.new_tensor(0.0)
 
         hard_indices = distances.detach().argmin(dim=-1)
         hard_assignment = F.one_hot(
@@ -817,14 +830,16 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
             scalars["config/temperature"] = float(self.popularity_softmax_temperature)
             scalars["config/top_k"] = float(self.popularity_balance_top_k)
             scalars["config/nominal_support"] = float(nominal_support)
-            scalars["config/popularity_nominal_gamma"] = float(self.popularity_nominal_gamma)
-            scalars["config/popularity_nominal_denominator"] = float(self.popularity_nominal_denominator)
-            scalars["config/popularity_ema_half_life_items"] = float(self.popularity_ema_half_life_items)
+            scalars["config/nominal_gamma"] = float(self.popularity_nominal_gamma)
+            scalars["config/nominal_denominator"] = float(self.popularity_nominal_denominator)
+            scalars["config/ema_half_life_items"] = float(self.popularity_ema_half_life_items)
+            scalars["config/token_balance_enabled"] = 1.0 if self.token_balance_enabled else 0.0
+            scalars["config/prefix_balance_enabled"] = 1.0 if self.popularity_prefix_balance_enabled else 0.0
             if self.popularity_balance_layer_weights:
                 for layer_idx, layer_weight in enumerate(self.popularity_balance_layer_weights):
-                    scalars[f"config/popularity_balance_layer_weight_{layer_idx}"] = float(layer_weight)
+                    scalars[f"config/layer_weight_{layer_idx}"] = float(layer_weight)
             if self.popularity_nominal_clip_value is not None:
-                scalars["config/popularity_nominal_clip_value"] = float(self.popularity_nominal_clip_value)
+                scalars["config/nominal_clip_value"] = float(self.popularity_nominal_clip_value)
             return {"scalars": scalars, "histograms": histograms}
 
     def compute_loss(self, original_embeddings: torch.Tensor, tokenizer_output: tuple, popularity_weights=None):
