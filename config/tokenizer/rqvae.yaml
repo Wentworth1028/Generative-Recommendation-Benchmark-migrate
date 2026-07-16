@@ -26,6 +26,7 @@ layer_weights: []
 top_k: 0
 token_balance_enabled: true
 prefix_balance_enabled: false
+prefix_distance_chunk_size: 8192
 log_distribution: false
 distribution_interval: 100
 ema_half_life_epochs: 1.0

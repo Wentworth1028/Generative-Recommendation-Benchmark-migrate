@@ -36,6 +36,9 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         self.popularity_prefix_balance_enabled = self._as_bool(
             self._config_get('prefix_balance_enabled', 'popularity_prefix_balance_enabled', False)
         )
+        self.prefix_distance_chunk_size = int(
+            self._config_get('prefix_distance_chunk_size', 'popularity_prefix_distance_chunk_size', 8192) or 0
+        )
         self.popularity_ema_half_life_epochs = float(self._config_get('ema_half_life_epochs', 'popularity_ema_half_life_epochs', 1.0))
         self.popularity_ema_half_life_items = self._resolve_ema_half_life_items()
         self.popularity_ema_normalize_item_weights = self._as_bool(
@@ -401,6 +404,38 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         mass = self._ensure_popularity_prefix_ema_mass(depth, codebook_size, device, dtype)
         return mass / mass.sum().clamp_min(self.popularity_balance_eps)
 
+    def _topk_codebook_distances(
+        self,
+        vectors: torch.Tensor,
+        codebook: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        original_shape = vectors.shape[:-1]
+        flat_vectors = vectors.reshape(-1, vectors.size(-1))
+        codebook_t = codebook.transpose(0, 1)
+        codebook_norm = (codebook ** 2).sum(dim=-1).view(1, -1)
+        chunk_size = self.prefix_distance_chunk_size
+        if chunk_size <= 0:
+            chunk_size = flat_vectors.size(0)
+
+        distance_chunks = []
+        index_chunks = []
+        for start in range(0, flat_vectors.size(0), chunk_size):
+            chunk = flat_vectors[start : start + chunk_size]
+            distances = (
+                (chunk ** 2).sum(dim=-1, keepdim=True)
+                + codebook_norm
+                - 2.0 * chunk.matmul(codebook_t)
+            ).clamp_min(0.0)
+            _, indices = torch.topk(distances.detach(), k=top_k, dim=-1, largest=False)
+            selected_distances = distances.gather(dim=-1, index=indices)
+            distance_chunks.append(selected_distances)
+            index_chunks.append(indices)
+
+        top_distances = torch.cat(distance_chunks, dim=0).view(*original_shape, top_k)
+        top_indices = torch.cat(index_chunks, dim=0).view(*original_shape, top_k)
+        return top_distances, top_indices
+
     def _compute_prefix_ema_item_popularity_balance_loss(
         self,
         residuals: torch.Tensor | None,
@@ -429,10 +464,13 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
         )
 
         latent = residuals[:, 0, :]
-        first_distances = ((latent.unsqueeze(1) - codebooks[0].unsqueeze(0)) ** 2).sum(dim=-1)
-        first_logits = -(first_distances / distance_scales[0]) / temperature
-        _, first_indices = torch.topk(first_distances.detach(), k=beam_width, dim=-1, largest=False)
-        first_probs = torch.softmax(first_logits.gather(dim=-1, index=first_indices), dim=-1)
+        first_top_distances, first_indices = self._topk_codebook_distances(
+            latent,
+            codebooks[0],
+            beam_width,
+        )
+        first_logits = -(first_top_distances / distance_scales[0]) / temperature
+        first_probs = torch.softmax(first_logits, dim=-1)
 
         beam_keys = first_indices
         beam_scores = first_probs
@@ -449,12 +487,13 @@ class RQVAETokenizerOptimizer(AbstractTokenizerOptimizer):
 
         for layer_idx in range(1, max_depth):
             current_codebook = codebooks[layer_idx]
-            child_distances = (
-                (beam_residuals.unsqueeze(2) - current_codebook.view(1, 1, codebook_size, -1)) ** 2
-            ).sum(dim=-1)
-            child_logits = -(child_distances / distance_scales[layer_idx]) / temperature
-            _, child_indices = torch.topk(child_distances.detach(), k=beam_width, dim=-1, largest=False)
-            child_probs = torch.softmax(child_logits.gather(dim=-1, index=child_indices), dim=-1)
+            child_top_distances, child_indices = self._topk_codebook_distances(
+                beam_residuals,
+                current_codebook,
+                beam_width,
+            )
+            child_logits = -(child_top_distances / distance_scales[layer_idx]) / temperature
+            child_probs = torch.softmax(child_logits, dim=-1)
 
             candidate_scores = beam_scores.unsqueeze(-1) * child_probs
             flat_scores = candidate_scores.reshape(batch_size, -1)
