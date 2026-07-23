@@ -36,6 +36,7 @@ commitment_beta: 0.25
 rq_kmeans_init: true
 kmeans_iters: 10
 learning_rate: 0.001
+finetune_from_checkpoint: null
 epochs: 20000
 batch_size: 1024
 log_interval: 10

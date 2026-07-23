@@ -243,7 +243,19 @@ class RQVAETrainer:
         if observation is None or item_count <= 0:
             return
 
+        def is_sparse_prefix_observation(value):
+            return (
+                isinstance(value, dict)
+                and "keys" in value
+                and "values" in value
+            )
+
         def scale_observation(value, scale):
+            if is_sparse_prefix_observation(value):
+                return {
+                    "keys": value["keys"],
+                    "values": value["values"] * scale,
+                }
             if isinstance(value, dict):
                 return {key: scale_observation(item, scale) for key, item in value.items()}
             if value is None:
@@ -251,6 +263,13 @@ class RQVAETrainer:
             return value * scale
 
         def reduce_observation(value):
+            if is_sparse_prefix_observation(value):
+                if self.accelerator is None:
+                    return value
+                return {
+                    "keys": self.accelerator.gather_for_metrics(value["keys"]),
+                    "values": self.accelerator.gather_for_metrics(value["values"]),
+                }
             if isinstance(value, dict):
                 return {key: reduce_observation(item) for key, item in value.items()}
             if value is None:
@@ -260,6 +279,11 @@ class RQVAETrainer:
             return value
 
         def divide_observation(value, denominator):
+            if is_sparse_prefix_observation(value):
+                return {
+                    "keys": value["keys"],
+                    "values": value["values"] / denominator,
+                }
             if isinstance(value, dict):
                 return {key: divide_observation(item, denominator) for key, item in value.items()}
             if value is None:
@@ -267,6 +291,8 @@ class RQVAETrainer:
             return value / denominator
 
         def first_tensor(value):
+            if is_sparse_prefix_observation(value):
+                return value["values"]
             if isinstance(value, dict):
                 for item in value.values():
                     found = first_tensor(item)
