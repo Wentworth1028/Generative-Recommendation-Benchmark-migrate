@@ -6,6 +6,7 @@ import os
 from tqdm import tqdm
 import numpy as np
 from collections import Counter
+from genrec.quantization.debias.trainer import PopularityDebiasController
 
 class RQVAETrainer:
     def __init__(
@@ -25,29 +26,18 @@ class RQVAETrainer:
         self.checkpoint_path = self.config.get('checkpoint_path')
         self.save_interval = self.config.get('save_interval')
         self.item_popularity = self.config.get('item_popularity', {})
-        self.popularity_balance_weight = float(self._config_get('balance_weight', 'popularity_balance_weight', 0.0))
-        self.target_popularity_balance_weight = self.popularity_balance_weight
-        self.popularity_balance_schedule = self._config_get('balance_schedule', 'popularity_balance_schedule', 'constant').lower()
-        self.popularity_balance_start_epoch = int(self._config_get('balance_start_epoch', 'popularity_balance_start_epoch', 0))
-        self.popularity_balance_warmup_epochs = int(self._config_get('balance_warmup_epochs', 'popularity_balance_warmup_epochs', 0))
-        self.popularity_balance_log_distribution = self._as_bool(
-            self._config_get('log_distribution', 'popularity_balance_log_distribution', False)
-        )
-        self.popularity_balance_distribution_interval = max(
-            1,
-            int(self._config_get('distribution_interval', 'popularity_balance_distribution_interval', 100) or 100),
+        self.debias = PopularityDebiasController(
+            self.config,
+            self.optimizer,
+            self.item_popularity,
+            self.device,
+            accelerator=self.accelerator,
         )
         self.tensorboard_enabled = self._as_bool(self.config.get('tensorboard_enabled', False))
         self.tensorboard_dir = self.config.get('tensorboard_dir')
         if not self.tensorboard_dir:
             self.tensorboard_dir = os.path.join(os.path.dirname(self.checkpoint_path), "tensorboard")
         self.summary_writer = None
-        if self.popularity_balance_schedule not in {'constant', 'linear', 'delayed'}:
-            raise ValueError(
-                f"Invalid popularity_balance_schedule: {self.popularity_balance_schedule}. "
-                "Must be 'constant', 'linear', or 'delayed'."
-            )
-
         self.save_best_on = self.config.get('save_best_on', 'collision_rate').lower()
         if self.save_best_on not in ['utilization', 'collision_rate']:
             raise ValueError(f"Invalid 'save_best_on' value: {self.save_best_on}. "
@@ -72,13 +62,6 @@ class RQVAETrainer:
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
 
-    def _config_get(self, key: str, legacy_key: str | None = None, default=None):
-        if key in self.config:
-            return self.config.get(key)
-        if legacy_key is not None and legacy_key in self.config:
-            return self.config.get(legacy_key)
-        return default
-
     def _quant_loss_weight(self) -> float:
         return float(getattr(self.optimizer, 'quant_loss_weight', self.config.get('quant_loss_weight', 1.0)))
 
@@ -86,11 +69,7 @@ class RQVAETrainer:
         return recon_loss + self._quant_loss_weight() * commit_loss
 
     def _popularity_balance_entropy_gap(self, popularity_balance_loss: float) -> float:
-        if not hasattr(self.optimizer, 'popularity_balance_entropy_floor'):
-            return 0.0
-        if getattr(self.optimizer, 'popularity_balance_mode', 'batch_entropy') != 'batch_entropy':
-            return 0.0
-        return popularity_balance_loss - float(self.optimizer.popularity_balance_entropy_floor())
+        return self.debias.entropy_gap(popularity_balance_loss)
 
     def _init_training_trace(self):
         if self.accelerator is not None and not self.accelerator.is_main_process:
@@ -202,117 +181,16 @@ class RQVAETrainer:
         self.summary_writer.flush()
 
     def _batch_popularity_weights(self, item_ids):
-        if (
-            self.target_popularity_balance_weight <= 0.0
-            and not self.popularity_balance_log_distribution
-        ):
-            return None
-        if torch.is_tensor(item_ids):
-            item_ids = item_ids.detach().cpu().tolist()
-        weights = [float(self.item_popularity.get(int(item_id), 0.0)) for item_id in item_ids]
-        return torch.tensor(weights, dtype=torch.float32, device=self.device)
+        return self.debias.batch_weights(item_ids)
 
     def _scheduled_popularity_balance_weight(self, epoch: int) -> float:
-        if self.target_popularity_balance_weight <= 0.0:
-            return 0.0
-        if self.popularity_balance_schedule == 'constant':
-            return self.target_popularity_balance_weight
-
-        start_epoch = max(self.popularity_balance_start_epoch, 0)
-        if epoch < start_epoch:
-            return 0.0
-        if self.popularity_balance_schedule == 'delayed':
-            return self.target_popularity_balance_weight
-
-        warmup_epochs = max(self.popularity_balance_warmup_epochs, 0)
-        if warmup_epochs == 0:
-            return self.target_popularity_balance_weight
-
-        progress = min(1.0, (epoch - start_epoch + 1) / warmup_epochs)
-        return self.target_popularity_balance_weight * progress
+        return self.debias.scheduled_weight(epoch)
 
     def _set_popularity_balance_weight(self, weight: float):
-        self.popularity_balance_weight = weight
-        if hasattr(self.optimizer, 'popularity_balance_weight'):
-            self.optimizer.popularity_balance_weight = weight
+        self.debias.set_weight(weight)
 
     def _apply_popularity_ema_update(self):
-        if not hasattr(self.optimizer, 'pop_pending_ema_observation'):
-            return
-        observation, item_count = self.optimizer.pop_pending_ema_observation()
-        if observation is None or item_count <= 0:
-            return
-
-        def is_sparse_prefix_observation(value):
-            return (
-                isinstance(value, dict)
-                and "keys" in value
-                and "values" in value
-            )
-
-        def scale_observation(value, scale):
-            if is_sparse_prefix_observation(value):
-                return {
-                    "keys": value["keys"],
-                    "values": value["values"] * scale,
-                }
-            if isinstance(value, dict):
-                return {key: scale_observation(item, scale) for key, item in value.items()}
-            if value is None:
-                return None
-            return value * scale
-
-        def reduce_observation(value):
-            if is_sparse_prefix_observation(value):
-                if self.accelerator is None:
-                    return value
-                return {
-                    "keys": self.accelerator.gather_for_metrics(value["keys"]),
-                    "values": self.accelerator.gather_for_metrics(value["values"]),
-                }
-            if isinstance(value, dict):
-                return {key: reduce_observation(item) for key, item in value.items()}
-            if value is None:
-                return None
-            if self.accelerator is not None:
-                return self.accelerator.reduce(value, reduction="sum")
-            return value
-
-        def divide_observation(value, denominator):
-            if is_sparse_prefix_observation(value):
-                return {
-                    "keys": value["keys"],
-                    "values": value["values"] / denominator,
-                }
-            if isinstance(value, dict):
-                return {key: divide_observation(item, denominator) for key, item in value.items()}
-            if value is None:
-                return None
-            return value / denominator
-
-        def first_tensor(value):
-            if is_sparse_prefix_observation(value):
-                return value["values"]
-            if isinstance(value, dict):
-                for item in value.values():
-                    found = first_tensor(item)
-                    if found is not None:
-                        return found
-                return None
-            return value
-
-        with torch.no_grad():
-            reference_tensor = first_tensor(observation)
-            if reference_tensor is None:
-                return
-            count_tensor = reference_tensor.new_tensor(float(item_count))
-            weighted_observation = scale_observation(observation, count_tensor)
-            if self.accelerator is not None:
-                weighted_observation = reduce_observation(weighted_observation)
-                count_tensor = self.accelerator.reduce(count_tensor, reduction="sum")
-            global_count = int(count_tensor.item())
-            mean_observation = divide_observation(weighted_observation, count_tensor.clamp_min(1.0))
-            self.optimizer.apply_popularity_ema_update(mean_observation, global_count)
+        self.debias.apply_ema_update()
 
     @staticmethod
     def _average_metrics(totals: dict[str, float], count: int) -> dict[str, float]:
@@ -408,20 +286,21 @@ class RQVAETrainer:
             self.optimizer.zero_grad()
             tokenizer_output = self.tokenizer(embeddings)
             popularity_weights = self._batch_popularity_weights(item_ids)
-            loss, reconstruction_loss, commit_loss, popularity_balance_loss = self.optimizer.compute_loss(
+            loss_values = self.optimizer.compute_loss(
                 embeddings,
                 tokenizer_output,
                 popularity_weights=popularity_weights,
             )
+            if len(loss_values) == 3:
+                loss, reconstruction_loss, commit_loss = loss_values
+                popularity_balance_loss = loss.new_zeros(())
+            else:
+                loss, reconstruction_loss, commit_loss, popularity_balance_loss = loss_values
             if (
-                self.popularity_balance_log_distribution
-                and step % self.popularity_balance_distribution_interval == 0
-                and hasattr(self.optimizer, "compute_popularity_distribution_metrics")
+                self.debias.log_distribution
+                and step % self.debias.distribution_interval == 0
             ):
-                distribution_metrics = self.optimizer.compute_popularity_distribution_metrics(
-                    tokenizer_output,
-                    popularity_weights=popularity_weights,
-                )
+                distribution_metrics = self.debias.distribution_metrics(tokenizer_output, popularity_weights)
                 if distribution_metrics:
                     scalars = distribution_metrics.get("scalars", {})
                     histograms = distribution_metrics.get("histograms", {})
@@ -439,7 +318,7 @@ class RQVAETrainer:
             total_commit_loss += commit_loss.item()
             total_popularity_balance_loss += popularity_balance_loss.item()
             if is_main and self.log_interval and step % self.log_interval == 0:
-                weighted_popularity_balance_loss = self.popularity_balance_weight * popularity_balance_loss.item()
+                weighted_popularity_balance_loss = self.debias.weight * popularity_balance_loss.item()
                 rq_loss_without_pop = self._rq_loss_without_pop(
                     reconstruction_loss.item(),
                     commit_loss.item(),

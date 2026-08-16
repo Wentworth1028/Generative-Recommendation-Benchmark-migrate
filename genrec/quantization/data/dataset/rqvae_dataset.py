@@ -4,6 +4,7 @@ from collections import defaultdict
 import pickle
 import torch
 import numpy as np
+from pathlib import Path
 from typing import Callable, Optional, Dict, List, Any, Tuple, Union
 from sentence_transformers import SentenceTransformer
 import os
@@ -24,7 +25,7 @@ class ItemEmbeddingDataset(Dataset):
     ) -> None:
         self.config = config
         self.data_text_files = data_text_files
-        self.text_encoder_model_name = text_encoder_model
+        self.text_encoder_model_name = self._resolve_text_encoder_model(text_encoder_model)
         self.embedding_strategy = embedding_extraction_strategy
         self.max_seq_length = max_seq_length
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -71,6 +72,19 @@ class ItemEmbeddingDataset(Dataset):
             
             del self.text_model
             torch.cuda.empty_cache()
+
+    @staticmethod
+    def _resolve_text_encoder_model(text_encoder_model: str) -> str:
+        """Prefer an existing local path; keep HF repo ids untouched."""
+        candidate = Path(os.path.expanduser(str(text_encoder_model)))
+        if candidate.exists():
+            return str(candidate.resolve())
+        if str(text_encoder_model).startswith((".", os.sep)):
+            raise FileNotFoundError(
+                f"Local text encoder path does not exist: {text_encoder_model}. "
+                "Use a valid local directory or a Hugging Face model id."
+            )
+        return str(text_encoder_model)
     
     def set_embedding_extraction_strategy(self, strategy: str) -> None:
         """

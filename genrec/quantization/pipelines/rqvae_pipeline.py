@@ -8,6 +8,7 @@ from collections import Counter
 
 from genrec.quantization.tokenizers.rqvae_tokenizer import RQVAETokenizer
 from genrec.quantization.optimizers.rqvae_optimizer import RQVAETokenizerOptimizer
+from genrec.quantization.debias.popularity_optimizer import PopularityRQVAETokenizerOptimizer
 from genrec.quantization.trainers.rqvae_trainer import RQVAETrainer
 from genrec.quantization.data.dataset.rqvae_dataset import create_item_dataloader
 
@@ -158,9 +159,35 @@ class RQVAETrainingPipeline:
         print("\n--- Initializing Model, Optimizer, and Trainer ---")
         self.config['item_popularity'] = self.item_popularity
         self.tokenizer = RQVAETokenizer(self.config)
-        self.optimizer = RQVAETokenizerOptimizer(self.config, self.tokenizer)
+        if self._popularity_debias_enabled():
+            optimizer_class = PopularityRQVAETokenizerOptimizer
+        else:
+            optimizer_class = RQVAETokenizerOptimizer
+        self.optimizer = optimizer_class(self.config, self.tokenizer)
+        print(f"Using tokenizer optimizer: {optimizer_class.__name__}")
         self.trainer = RQVAETrainer(self.config, self.tokenizer, self.optimizer, accelerator=self.accelerator)
         print("Initialization complete.")
+
+    def _popularity_debias_enabled(self) -> bool:
+        """Select the debias optimizer without changing legacy YAML names."""
+        def as_bool(value):
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(value)
+
+        balance_weights = [
+            float(self.config.get('balance_weight', 0.0) or 0.0),
+            float(self.config.get('popularity_balance_weight', 0.0) or 0.0),
+        ]
+        prefix_enabled = any(
+            as_bool(self.config.get(key, False))
+            for key in ('prefix_balance_enabled', 'popularity_prefix_balance_enabled')
+        )
+        log_distribution = any(
+            as_bool(self.config.get(key, False))
+            for key in ('log_distribution', 'popularity_balance_log_distribution')
+        )
+        return max(balance_weights) > 0.0 or prefix_enabled or log_distribution
 
     def _initialize_codebooks(self):
         """Initializes the RQ-VAE codebooks using K-Means (Main Process Only)."""
