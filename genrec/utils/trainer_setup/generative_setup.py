@@ -68,7 +68,10 @@ def setup_training(
         EarlyStoppingCallback(early_stopping_patience=model_config.get("early_stop_upper_steps", 1000)),
         GenerativeLoggingCallback(logger),
         # start_epoch means when to start evaluate
-        DelayedEvaluateEveryNEpochsCallback(n_epochs=model_config.get("evaluation_epoch", 5), start_epoch=40),
+        DelayedEvaluateEveryNEpochsCallback(
+            n_epochs=model_config.get("evaluation_epoch", 5),
+            start_epoch=model_config.get("evaluation_start_epoch", 40),
+        ),
     ]
 
     trainer_partial = instantiate(generative_config.trainer)

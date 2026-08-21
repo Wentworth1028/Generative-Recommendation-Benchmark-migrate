@@ -777,7 +777,7 @@ class PopularityRQVAETokenizerOptimizer(RQVAETokenizerOptimizer):
         tokenizer_output: tuple,
         popularity_weights=None,
     ) -> dict[str, dict]:
-        if not self.popularity_balance_log_distribution:
+        if not self.popularity_balance_log_distribution or self.popularity_balance_weight <= 0.0:
             return {}
         if popularity_weights is None:
             return {}

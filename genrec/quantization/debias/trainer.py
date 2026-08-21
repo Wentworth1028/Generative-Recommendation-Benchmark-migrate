@@ -40,6 +40,22 @@ class PopularityDebiasController:
                     f"Invalid popularity_balance_schedule: {self.schedule}. "
                     "Must be 'constant', 'linear', or 'delayed'."
                 )
+        self.item_popularity_tensor = self._build_item_popularity_tensor()
+
+    def _build_item_popularity_tensor(self):
+        if not self.item_popularity:
+            return torch.empty(0, dtype=torch.float32)
+        try:
+            max_item_id = max(int(item_id) for item_id in self.item_popularity.keys())
+        except (TypeError, ValueError):
+            return torch.empty(0, dtype=torch.float32)
+        lookup = torch.zeros(max_item_id + 1, dtype=torch.float32)
+        for item_id, popularity in self.item_popularity.items():
+            try:
+                lookup[int(item_id)] = float(popularity)
+            except (TypeError, ValueError):
+                continue
+        return lookup
 
     @staticmethod
     def _as_bool(value):
@@ -59,12 +75,22 @@ class PopularityDebiasController:
         return default
 
     def batch_weights(self, item_ids):
-        if not self.enabled or (self.target_weight <= 0.0 and not self.log_distribution):
+        if (
+            not self.enabled
+            or self.weight <= 0.0
+            or self.item_popularity_tensor.numel() == 0
+        ):
             return None
         if torch.is_tensor(item_ids):
-            item_ids = item_ids.detach().cpu().tolist()
-        weights = [float(self.item_popularity.get(int(item_id), 0.0)) for item_id in item_ids]
-        return torch.tensor(weights, dtype=torch.float32, device=self.device)
+            item_ids = item_ids.detach().long().cpu()
+        else:
+            item_ids = torch.as_tensor(item_ids, dtype=torch.long)
+        if item_ids.numel() == 0:
+            return torch.empty_like(item_ids, dtype=torch.float32, device=self.device)
+        item_ids = item_ids.clamp_min(0)
+        item_ids = item_ids.clamp_max(self.item_popularity_tensor.size(0) - 1)
+        weights = self.item_popularity_tensor.index_select(0, item_ids.reshape(-1)).view(item_ids.shape)
+        return weights.to(device=self.device)
 
     def scheduled_weight(self, epoch):
         if not self.enabled or self.target_weight <= 0.0:
@@ -95,7 +121,7 @@ class PopularityDebiasController:
         return popularity_balance_loss - float(self.optimizer.popularity_balance_entropy_floor())
 
     def distribution_metrics(self, tokenizer_output, popularity_weights):
-        if not self.enabled or not self.log_distribution:
+        if not self.enabled or not self.log_distribution or self.weight <= 0.0:
             return {}
         return self.optimizer.compute_popularity_distribution_metrics(
             tokenizer_output,
