@@ -1,0 +1,18 @@
+# GHOST tokenizer configuration
+data_text_files: "./data/Toy/item2title.pkl"
+text_encoder_model: "../sentence-t5-base"
+interaction_files: "./data/Toy/user2item.pkl"
+batch_size: 1024
+num_workers: 4
+embedding_strategy: "mean_pooling"
+projection_method: "pca"
+head_ratio: 0.2
+skeleton_length: 4
+tail_extra_length: 2
+semantic_dim: 32
+codebook_size: 256
+reserve_tokens: 2
+auo_ka: 200
+auo_kb: 5
+kmeans_n_init: "auto"
+kmeans_max_iter: 100

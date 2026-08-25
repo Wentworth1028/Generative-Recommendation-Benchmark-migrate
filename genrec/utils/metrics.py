@@ -25,8 +25,7 @@ def compute_metrics(p: EvalPrediction, tokens_to_item_map: dict, k_list: List[in
         
         item_ids = []
         for seq in user_sequences:
-            tokens_tuple = tuple(seq.tolist())
-            item_id = tokens_to_item_map.get(tokens_tuple, None)
+            item_id = tokens_to_item_id(seq, tokens_to_item_map)
             item_ids.append(item_id)
         
 

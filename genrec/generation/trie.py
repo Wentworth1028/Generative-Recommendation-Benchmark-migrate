@@ -1,9 +1,18 @@
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 class Trie(object):
-    def __init__(self, item2tokens: Dict[int,Tuple] = {}):
+    def __init__(
+        self,
+        item2tokens: Dict[int, Tuple] = {},
+        bos_token_id: int = 0,
+        eos_token_id: int | None = None,
+        append_eos: bool = False,
+    ):
         self.trie_dict = {}
         self.len = 0
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.append_eos = append_eos
         sequences = self.add_prefix(item2tokens)
         if sequences:
             for sequence in sequences:
@@ -11,11 +20,15 @@ class Trie(object):
                 self.len += 1
 
         self.append_trie = None
-        self.bos_token_id = None
 
     
     def add_prefix(self, item2tokens: Dict[int,Tuple]):
-        prefix_added_items = [[0] + list(items) for _,items in item2tokens.items()]
+        prefix_added_items = []
+        for _, items in item2tokens.items():
+            sequence = list(items)
+            if self.append_eos and self.eos_token_id is not None:
+                sequence = sequence + [int(self.eos_token_id)]
+            prefix_added_items.append([int(self.bos_token_id)] + sequence)
         return prefix_added_items
     
     def append(self, trie, bos_token_id):

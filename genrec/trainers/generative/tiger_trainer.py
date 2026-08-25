@@ -16,9 +16,10 @@ import math
 from transformers import LogitsProcessor
 
 class FastTrieLogitsProcessor(LogitsProcessor):
-    def __init__(self, trie, vocab_size: int):
+    def __init__(self, trie, vocab_size: int, fallback_token_id: int | None = None):
         self.trie = trie
         self.vocab_size = vocab_size
+        self.fallback_token_id = fallback_token_id
         self.tensor_mask_cache = {}
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
@@ -35,6 +36,8 @@ class FastTrieLogitsProcessor(LogitsProcessor):
                 
                 if allowed_tokens:
                     node_mask[allowed_tokens] = 0.0
+                elif self.fallback_token_id is not None and 0 <= self.fallback_token_id < self.vocab_size:
+                    node_mask[self.fallback_token_id] = 0.0
 
                 self.tensor_mask_cache[seq_tuple] = node_mask
             scores[i, :] += self.tensor_mask_cache[seq_tuple]
@@ -103,7 +106,9 @@ class TigerTrainer(BaseGenerativeTrainer):
             if self.inference_mode == "CBS":
                 self.prefix_allowed_fn = prefix_allowed_tokens_fn(self.candidate_trie)
             if self.inference_mode == "FastCBS":
-                trie_processor = FastTrieLogitsProcessor(self.candidate_trie,self.vocab_size)
+                trie_processor = FastTrieLogitsProcessor(
+                    self.candidate_trie, self.vocab_size, fallback_token_id=self.eos_token_id
+                )
                 self.processors = LogitsProcessorList([trie_processor])
         else:
             self.candidate_trie = None

@@ -9,13 +9,10 @@ from accelerate import Accelerator
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from genrec.quantization.pipelines.rqvae_pipeline import RQVAETrainingPipeline
-from genrec.quantization.tokenizers.rqvae_tokenizer import RQVAETokenizer
-from genrec.data.collators.generative.tiger_collator import TigerDataCollator
 from genrec.utils.nni_utils import get_nni_params, update_config_with_nni
-from genrec.utils.common_utils import set_seed
+from genrec.utils.common_utils import infer_tokenizer_kind, set_seed, tokenizer_artifacts_ready, tokens_to_item_id
 from genrec.utils.logging_utils import setup_logging
-from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class
+from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class, get_tokenizer_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
 from genrec.utils.popularity_metrics import (
     compute_dataset_item_popularity,
@@ -74,9 +71,13 @@ def stage1_train_tokenizer(
     tokenizer_checkpoint = rqvae_config['checkpoint_path']
     item2tokens_path = rqvae_config['save_path']
 
-    if not force_retrain and os.path.exists(item2tokens_path):
+    if not force_retrain and tokenizer_artifacts_ready(item2tokens_path, gen_type):
         print(f"exist tokenizer checkpoint: {tokenizer_checkpoint}")
         print("skip tokenizer training...")
+        PipelineClass = get_pipeline_class(gen_type)
+        pipeline = PipelineClass(rqvae_config, accelerator=accelerator)
+        if hasattr(pipeline, "export_existing_popularity_token_csv"):
+            pipeline.export_existing_popularity_token_csv()
         return True
 
     required_files = [rqvae_config['data_text_files'], rqvae_config['interaction_files']]
@@ -132,7 +133,9 @@ def stage2_train_generation_model(
         logger.info("-" * 40)
     if accelerator.is_main_process:
         logger.info(f"loading Tokenizer...")
-    tokenizer = RQVAETokenizer.load(rqvae_config)
+    tokenizer_kind = infer_tokenizer_kind(gen_type)
+    TokenizerClass = get_tokenizer_class(tokenizer_kind)
+    tokenizer = TokenizerClass.load(rqvae_config)
     if accelerator.is_main_process:
         logger.info(f"total {len(tokenizer.item2tokens)} item")
         logger.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
@@ -144,17 +147,20 @@ def stage2_train_generation_model(
         logger.info(f"use user tokens: {use_user_tokens}")
 
     create_model_fn = get_model_factory(gen_type)
-    vocab_size = tokenizer.vocab_size if use_user_tokens else tokenizer.vocab_size - tokenizer.num_user_tokens
+    vocab_size = tokenizer.vocab_size if use_user_tokens else tokenizer.vocab_size - getattr(tokenizer, "num_user_tokens", 0)
+
+    if tokenizer_kind == "ghost" and not model_config.get("ghost_collection_path"):
+        model_config["ghost_collection_path"] = rqvae_config["save_path"].replace(
+            ".json", "_undesired_collection.json"
+        )
+    if gen_type.startswith("ghost") and not model_config.get("ghost_variant"):
+        model_config["ghost_variant"] = "skt_only" if "skt_only" in gen_type else "ghost"
+
+    model = create_model_fn(vocab_size=vocab_size, model_config=model_config)
     if do_inference_only:
         if accelerator.is_main_process:
             logger.info(f"loading hf model from dir: {output_dirs['model']}")
-        # model = create_model_fn(vocab_size=vocab_size, model_config=model_config)
-        # model.load_state_dict(torch.load(model_save_path, map_location='cpu'), strict=False)
-        from transformers import AutoModelForSeq2SeqLM
-
-        model = AutoModelForSeq2SeqLM.from_pretrained(output_dirs['model'])
-    else:
-        model = create_model_fn(vocab_size=vocab_size, model_config=model_config)
+        model = model.__class__.from_pretrained(output_dirs["model"])
     # if use_user_tokens:
     #     model = create_tiger_model(
     #     vocab_size=tokenizer.vocab_size,
@@ -268,8 +274,7 @@ def stage2_train_generation_model(
             seen = set()
             item_ids = []
             for seq in user_sequences:
-                tokens_tuple = tuple(seq.tolist())
-                item_id = tokenizer.tokens2item.get(tokens_tuple, None)
+                item_id = tokens_to_item_id(seq, tokenizer.tokens2item)
                 if item_id is None or item_id in seen:
                     continue
                 seen.add(item_id)
@@ -384,7 +389,11 @@ def main(cfg: DictConfig):
 
     success = True
 
-    rqvae_config = OmegaConf.to_container(cfg.tokenizer, resolve=True)
+    tokenizer_cfg = cfg.tokenizer
+    if infer_tokenizer_kind(cfg.tokenizer_type) == "ghost":
+        tokenizer_cfg = OmegaConf.merge(OmegaConf.load("config/tokenizer/ghost.yaml"), tokenizer_cfg)
+
+    rqvae_config = OmegaConf.to_container(tokenizer_cfg, resolve=True)
     rqvae_config['device'] = device
     rqvae_config['tokenizer_path'] = os.path.join(output_dirs['tokenizer'], 'tokenizer.pkl')
     rqvae_config['save_path'] = os.path.join(output_dirs['tokenizer'], 'item2tokens.json')

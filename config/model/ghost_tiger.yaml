@@ -1,0 +1,36 @@
+# GHOST TIGER configuration
+data_interaction_files: "./data/Beauty/user2item.pkl"
+data_text_files: "./data/Beauty/item2title.pkl"
+max_seq_len: 20
+padding_side: "left"
+ignored_label: -100
+vocab_size: 1024
+d_kv: 64
+d_ff: 1024
+d_model: 128
+num_layers: 4
+num_decoder_layers: 4
+num_heads: 6
+dropout_rate: 0.1
+tie_word_embeddings: true
+batch_size: 1024
+test_batch_size: 256
+learning_rate: 2e-3
+num_epochs: 200
+num_steps: null
+k_list: [1, 5, 10]
+use_generative: true
+num_beams: 10
+inference_mode: "FastCBS"
+max_gen_length: 8
+weight_decay: 0.2
+warmup_ratio: 0.05
+early_stop_upper_steps: 5
+evaluation_epoch: 1
+use_user_tokens: false
+tau: 1.0
+ghost_variant: "ghost"
+auo_alpha: 0.1
+auo_ka: 200
+auo_kb: 5
+auo_temperature: 1.0

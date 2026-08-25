@@ -4,7 +4,7 @@ from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from genrec.utils.factory import get_pipeline_class
 from genrec.utils.nni_utils import get_nni_params, update_config_with_nni
-from genrec.utils.common_utils import set_seed
+from genrec.utils.common_utils import set_seed, tokenizer_artifacts_ready
 from genrec.utils.logging_utils import setup_logging
 
 import hydra
@@ -43,7 +43,7 @@ def stage1_train_tokenizer(rqvae_config: dict, output_dirs: dict, gen_type: str,
     tokenizer_checkpoint = rqvae_config['checkpoint_path']
     item2tokens_path = rqvae_config['save_path']
     
-    if not force_retrain and os.path.exists(tokenizer_checkpoint) and os.path.exists(item2tokens_path):
+    if not force_retrain and os.path.exists(tokenizer_checkpoint) and tokenizer_artifacts_ready(item2tokens_path, gen_type):
         print(f"exist tokenizer checkpoint: {tokenizer_checkpoint}")
         print("skip tokenizer training...")
         PipelineClass = get_pipeline_class(gen_type)
@@ -96,7 +96,11 @@ def main(cfg: DictConfig):
     
     success = True
     
-    rqvae_config = OmegaConf.to_container(cfg.tokenizer, resolve=True)
+    tokenizer_cfg = cfg.tokenizer
+    if str(cfg.type).lower().startswith("ghost"):
+        tokenizer_cfg = OmegaConf.merge(OmegaConf.load("config/tokenizer/ghost.yaml"), tokenizer_cfg)
+
+    rqvae_config = OmegaConf.to_container(tokenizer_cfg, resolve=True)
     rqvae_config['device'] = device
     rqvae_config['tokenizer_path'] = os.path.join(output_dirs['tokenizer'], 'tokenizer.pkl')
     rqvae_config['save_path'] = os.path.join(output_dirs['tokenizer'], 'item2tokens.json')

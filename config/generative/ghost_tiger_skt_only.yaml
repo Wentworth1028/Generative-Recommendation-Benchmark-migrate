@@ -1,0 +1,7 @@
+defaults:
+  - /model: ghost_tiger_skt_only
+type: "ghost_tiger_skt_only"
+tokenizer_type: "ghost"
+trainer:
+  _target_: genrec.trainers.generative.tiger_trainer.TigerTrainer
+  _partial_: true

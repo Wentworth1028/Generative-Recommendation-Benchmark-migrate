@@ -1,8 +1,13 @@
-import torch
-import numpy as np
-import random
+from pathlib import Path
 import ast
-import json 
+import json
+import random
+
+import numpy as np
+import torch
+
+from genrec.ghost.utils import tokens_key
+from genrec.ghost.utils import infer_tokenizer_kind
 
 
 def load_json_file(file_path):
@@ -15,17 +20,28 @@ def tokens_to_item_id(
     tokens_sequence, 
     tokens_to_item_map
 ):
-
+    if not tokens_to_item_map:
+        return None
     if torch.is_tensor(tokens_sequence):
         tokens_list = tokens_sequence.tolist()
     else:
         tokens_list = tokens_sequence
-    
 
-    tokens_tuple = tuple(tokens_list)
-    
+    return tokens_to_item_map.get(tokens_key(tokens_list), None)
 
-    return tokens_to_item_map.get(tokens_tuple, None)
+
+def tokenizer_artifacts_ready(save_path: str, tokenizer_kind: str | None = None) -> bool:
+    item2tokens_path = Path(save_path)
+    if not item2tokens_path.exists():
+        return False
+
+    kind = infer_tokenizer_kind(tokenizer_kind or "")
+    if kind != "ghost":
+        return True
+
+    metadata_path = Path(str(item2tokens_path).replace("item2tokens.json", "ghost_metadata.json"))
+    undesired_collection_path = Path(str(item2tokens_path).replace(".json", "_undesired_collection.json"))
+    return metadata_path.exists() and undesired_collection_path.exists()
 
 
 
@@ -54,5 +70,3 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-

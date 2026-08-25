@@ -143,12 +143,20 @@ def compute_token_popularity_metrics(
     item2tokens: Dict[int, Sequence[int]],
     item_popularity: Dict[int, int],
     codebook_size: int = 256,
-    reserve_tokens: int = 100,
+    reserve_tokens: int | None = None,
 ) -> Dict[str, float]:
     if not item2tokens:
         return {}
 
-    num_layers = len(next(iter(item2tokens.values())))
+    num_layers = max(len(tokens) for tokens in item2tokens.values())
+    if reserve_tokens is None:
+        reserve_candidates = [
+            int(token_id)
+            for tokens in item2tokens.values()
+            for token_id in tokens
+            if tokens
+        ]
+        reserve_tokens = min(reserve_candidates) if reserve_candidates else 0
     metrics = {}
     for layer in range(num_layers):
         masses = [0.0 for _ in range(codebook_size)]
