@@ -46,14 +46,14 @@ class LETTERRQVAE(RQVAE):
                                           )
     def forward(self, x, labels): 
         x = self.encoder(x)
-        x_q, rq_loss, indices = self.rq(x, labels)
+        x_q, rq_loss, indices, all_distances, quantization_context = self.rq(x, labels)
         out = self.decoder(x_q)
 
-        return out, rq_loss, indices, x_q
+        return out, rq_loss, indices, x_q, all_distances, quantization_context
     @torch.no_grad()
     def get_indices(self, xs, labels):
         x_e = self.encoder(xs)
-        _, _, indices = self.rq(x_e, labels)
+        _, _, indices, _, _ = self.rq(x_e, labels)
         return indices
 class LETTERResidualVectorQuantizer(ResidualVectorQuantizer):
     def __init__(self, n_e_list, e_dim,commitment_beta=0.25,
@@ -76,6 +76,9 @@ class LETTERResidualVectorQuantizer(ResidualVectorQuantizer):
     def forward(self, x, labels):
         all_losses = []
         all_indices = []
+        all_distances = []
+        all_residuals = []
+        all_codebooks = []
         x_q = 0
         residual = x
 
@@ -84,7 +87,10 @@ class LETTERResidualVectorQuantizer(ResidualVectorQuantizer):
                 label = labels[str(idx)]
             else:
                 label = None
-            x_res, loss, indices = quantizer(residual, label, idx)
+            all_residuals.append(residual)
+            all_codebooks.append(quantizer.embedding.weight)
+            x_res, loss, indices, distances = quantizer(residual, label, idx)
+            all_distances.append(distances)
             residual = residual - x_res
             x_q = x_q + x_res
             all_losses.append(loss)
@@ -92,8 +98,13 @@ class LETTERResidualVectorQuantizer(ResidualVectorQuantizer):
 
         mean_losses = torch.stack(all_losses).mean()
         all_indices = torch.stack(all_indices, dim=-1)
+        all_distances = torch.stack(all_distances, dim=1)
+        quantization_context = {
+            "residuals": torch.stack(all_residuals, dim=1),
+            "codebooks": torch.stack(all_codebooks, dim=0),
+        }
 
-        return x_q, mean_losses, all_indices
+        return x_q, mean_losses, all_indices, all_distances, quantization_context
 class LETTERVectorQuantizer(VectorQuantizer):
     def __init__(self, n_e, e_dim, mu=0.25, diversity_beta=1,
                  kmeans_init=False, kmeans_iters=10):
@@ -180,4 +191,4 @@ class LETTERVectorQuantizer(VectorQuantizer):
         loss = codebook_loss + self.mu * commitment_loss + self.diversity_beta * diversity_loss
         x_q = x + (x_q - x).detach()
         indices = indices.view(x.shape[:-1])
-        return x_q, loss, indices
+        return x_q, loss, indices, d

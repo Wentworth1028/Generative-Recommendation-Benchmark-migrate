@@ -39,8 +39,22 @@ class LETTERRQVAETokenizer(RQVAETokenizer):
             commitment_beta=self.config['commitment_beta'],
         )
     def forward(self, embeddings: torch.Tensor, labels: dict):
-        reconstructed_embeddings, quant_loss, indices, dense_reconstructed_embeddings = self.rq_vae(embeddings, labels)
-        return reconstructed_embeddings, indices, quant_loss, dense_reconstructed_embeddings
+        (
+            reconstructed_embeddings,
+            quant_loss,
+            indices,
+            dense_quantized_embeddings,
+            distances,
+            quantization_context,
+        ) = self.rq_vae(embeddings, labels)
+        return (
+            reconstructed_embeddings,
+            indices,
+            quant_loss,
+            distances,
+            quantization_context,
+            dense_quantized_embeddings,
+        )
     def encode(self, embeddings: torch.Tensor, labels = None) -> torch.Tensor:
         """
         Encodes embeddings into discrete codebook indices.

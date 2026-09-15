@@ -6,7 +6,6 @@ import random
 import numpy as np
 import torch
 
-from genrec.ghost.utils import tokens_key
 from genrec.ghost.utils import infer_tokenizer_kind
 
 
@@ -27,7 +26,8 @@ def tokens_to_item_id(
     else:
         tokens_list = tokens_sequence
 
-    return tokens_to_item_map.get(tokens_key(tokens_list), None)
+    tokens_tuple = tuple(tokens_list)
+    return tokens_to_item_map.get(tokens_tuple, None)
 
 
 def tokenizer_artifacts_ready(save_path: str, tokenizer_kind: str | None = None) -> bool:

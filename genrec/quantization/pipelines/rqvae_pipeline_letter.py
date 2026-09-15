@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import pickle
+from collections import Counter
 
 from genrec.quantization.tokenizers.letter_tokenizer import LETTERRQVAETokenizer
 from genrec.quantization.optimizers.letter_optimizer import LETTERRQVAETokenizerOptimizer
@@ -50,6 +51,24 @@ class LETTERRQVAETrainingPipeline:
         if self.final_model_decision not in ['save_final', 'save_best']:
             raise ValueError(f"Invalid 'final_model_decision' value: {self.final_model_decision}. "
                              f"Must be 'save_final' or 'save_best'.")
+        self.item_popularity = {}
+
+    def _is_main_process(self):
+        return self.accelerator is None or self.accelerator.is_main_process
+
+    def _compute_item_popularity(self):
+        interaction_path = self.config['interaction_files']
+        with open(interaction_path, 'rb') as f:
+            user2item_data = pickle.load(f)
+
+        counter = Counter()
+        for _, row in user2item_data.iterrows():
+            item_seq = row['ItemID']
+            counter.update(int(item_id) for item_id in item_seq)
+
+        if self._is_main_process():
+            print(f"Computed popularity for {len(counter)} items from: {interaction_path}")
+        return dict(counter)
 
     def _prepare_data(self):
         """Creates the dataset and dataloader."""
@@ -104,6 +123,8 @@ class LETTERRQVAETrainingPipeline:
     def _initialize_components(self):
         """Initializes the model, optimizer, and trainer."""
         print("\n--- Initializing Model, Optimizer, and Trainer ---")
+        self.item_popularity = self._compute_item_popularity()
+        self.config['item_popularity'] = self.item_popularity
         self.tokenizer = LETTERRQVAETokenizer(self.config)
         self.optimizer = LETTERRQVAETokenizerOptimizer(self.config, self.tokenizer)
         self.trainer = LETTERRQVAETrainer(self.config, self.tokenizer, self.optimizer, accelerator=self.accelerator)
@@ -126,6 +147,33 @@ class LETTERRQVAETrainingPipeline:
         print("\n--- Starting Tokenizer Training ---")
         self.trainer.fit(self.train_dataloader,self.valid_dataloader)
         print("Training finished.")
+
+    @staticmethod
+    def _optional_path(value):
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+            return None
+        return str(value)
+
+    def _load_rqvae_checkpoint(self, checkpoint_path: str, purpose: str = "checkpoint"):
+        device = self.config.get('device', 'cpu')
+        original_state_dict = torch.load(checkpoint_path, map_location=device)
+        if isinstance(original_state_dict, dict) and "state_dict" in original_state_dict:
+            original_state_dict = original_state_dict["state_dict"]
+
+        new_state_dict = {}
+        for key, value in original_state_dict.items():
+            new_key = key
+            if new_key.startswith('module.'):
+                new_key = new_key[len('module.'):]
+            if new_key.startswith('rq_vae.'):
+                new_key = new_key[len('rq_vae.'):]
+            new_state_dict[new_key] = value
+
+        self.tokenizer.rq_vae.load_state_dict(new_state_dict)
+        self.tokenizer.rq_vae.to(device)
+        print(f"--- RQ-VAE model loaded successfully from {purpose}: {checkpoint_path} ---")
 
     def _finalize_and_verify(self):
         """Finalizes the Tokenizer and verifies its functionality."""
@@ -151,24 +199,30 @@ class LETTERRQVAETrainingPipeline:
         
         self._prepare_data()
         self._initialize_components()
-        checkpoint_path = self.config.get('checkpoint_path')
+        checkpoint_path = self._optional_path(self.config.get('checkpoint_path'))
+        finetune_from_checkpoint = self._optional_path(self.config.get('finetune_from_checkpoint'))
+        if finetune_from_checkpoint:
+            if not os.path.exists(finetune_from_checkpoint):
+                raise FileNotFoundError(f"Fine-tune source checkpoint does not exist: {finetune_from_checkpoint}")
+            print(f"\n--- Fine-tuning RQ-VAE from checkpoint '{finetune_from_checkpoint}'. ---")
+            print("--- Loading source model and continuing tokenizer training. ---")
+            self._load_rqvae_checkpoint(finetune_from_checkpoint, purpose="fine-tune source")
+            self._train()
+            if checkpoint_path and os.path.exists(checkpoint_path) and self.final_model_decision == 'save_best':
+                print(f"\n--- Best fine-tuned checkpoint found at '{checkpoint_path}'. ---")
+                try:
+                    self._load_rqvae_checkpoint(checkpoint_path, purpose="best fine-tuned checkpoint")
+                except Exception as e:
+                    print(f"--- Error loading checkpoint: {e} ---")
+            self._finalize_and_verify()
+            print("\n--- RQ-VAE Training Pipeline Finished Successfully ---")
+            return
+
         if checkpoint_path and os.path.exists(checkpoint_path):
             print(f"\n--- Checkpoint found at '{checkpoint_path}'. ---")
             print("--- Loading model from checkpoint and skipping training. ---")
             try:
-                device = self.config.get('device', 'cpu')
-                original_state_dict = torch.load(checkpoint_path, map_location=device)
-                new_state_dict = {}
-                prefix = 'rq_vae.'
-                for key, value in original_state_dict.items():
-                    if key.startswith(prefix):
-                        new_key = key[len(prefix):]
-                        new_state_dict[new_key] = value
-                    else:
-                        new_state_dict[key] = value
-                self.tokenizer.rq_vae.load_state_dict(new_state_dict)
-                self.tokenizer.rq_vae.to(device)
-                print("--- Model loaded successfully. ---")
+                self._load_rqvae_checkpoint(checkpoint_path)
             except Exception as e:
                 print(f"--- Error loading checkpoint: {e} ---")
                 print("--- Proceeding with full training pipeline instead. ---")
@@ -177,19 +231,7 @@ class LETTERRQVAETrainingPipeline:
                 if checkpoint_path and os.path.exists(checkpoint_path) and self.final_model_decision == 'save_best':
                     print(f"\n--- Best usage checkpoint found at '{checkpoint_path}'. ---")
                     try:
-                        device = self.config.get('device', 'cpu')
-                        original_state_dict = torch.load(checkpoint_path, map_location=device)
-                        new_state_dict = {}
-                        prefix = 'rq_vae.'
-                        for key, value in original_state_dict.items():
-                            if key.startswith(prefix):
-                                new_key = key[len(prefix):]
-                                new_state_dict[new_key] = value
-                            else:
-                                new_state_dict[key] = value
-                        self.tokenizer.rq_vae.load_state_dict(new_state_dict)
-                        self.tokenizer.rq_vae.to(device)
-                        print("--- Best usage model loaded successfully. ---")
+                        self._load_rqvae_checkpoint(checkpoint_path, purpose="best usage checkpoint")
                     except Exception as e:
                         print(f"--- Error loading checkpoint: {e} ---")
         else:
@@ -199,19 +241,7 @@ class LETTERRQVAETrainingPipeline:
             if checkpoint_path and os.path.exists(checkpoint_path) and self.final_model_decision == 'save_best':
                 print(f"\n--- Best usage checkpoint found at '{checkpoint_path}'. ---")
                 try:
-                    device = self.config.get('device', 'cpu')
-                    original_state_dict = torch.load(checkpoint_path, map_location=device)
-                    new_state_dict = {}
-                    prefix = 'rq_vae.'
-                    for key, value in original_state_dict.items():
-                        if key.startswith(prefix):
-                            new_key = key[len(prefix):]
-                            new_state_dict[new_key] = value
-                        else:
-                            new_state_dict[key] = value
-                    self.tokenizer.rq_vae.load_state_dict(new_state_dict)
-                    self.tokenizer.rq_vae.to(device)
-                    print("--- Best usage model loaded successfully. ---")
+                    self._load_rqvae_checkpoint(checkpoint_path, purpose="best usage checkpoint")
                 except Exception as e:
                     print(f"--- Error loading checkpoint: {e} ---")
         

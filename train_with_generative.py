@@ -10,7 +10,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from genrec.utils.nni_utils import get_nni_params, update_config_with_nni
-from genrec.utils.common_utils import infer_tokenizer_kind, set_seed, tokenizer_artifacts_ready, tokens_to_item_id
+from genrec.utils.common_utils import infer_tokenizer_kind, set_seed, tokenizer_artifacts_ready
 from genrec.utils.logging_utils import setup_logging
 from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class, get_tokenizer_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
@@ -131,6 +131,8 @@ def stage2_train_generation_model(
         logger.info(f"   - Seed:          {model_config.get('seed')}")
         logger.info(f"   - Inference:     {model_config.get('inference_mode')}")
         logger.info("-" * 40)
+    gen_type = generative_config.type
+    use_user_tokens = model_config['use_user_tokens']
     if accelerator.is_main_process:
         logger.info(f"loading Tokenizer...")
     tokenizer_kind = infer_tokenizer_kind(gen_type)
@@ -139,9 +141,6 @@ def stage2_train_generation_model(
     if accelerator.is_main_process:
         logger.info(f"total {len(tokenizer.item2tokens)} item")
         logger.info(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
-
-    gen_type = generative_config.type
-    use_user_tokens = model_config['use_user_tokens']
     if accelerator.is_main_process:
         logger.info(f"generative mode type: {gen_type}")
         logger.info(f"use user tokens: {use_user_tokens}")
@@ -274,7 +273,8 @@ def stage2_train_generation_model(
             seen = set()
             item_ids = []
             for seq in user_sequences:
-                item_id = tokens_to_item_id(seq, tokenizer.tokens2item)
+                tokens_tuple = tuple(seq.tolist())
+                item_id = tokenizer.tokens2item.get(tokens_tuple, None)
                 if item_id is None or item_id in seen:
                     continue
                 seen.add(item_id)

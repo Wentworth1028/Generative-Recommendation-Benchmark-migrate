@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 from collections import Counter
 from k_means_constrained import KMeansConstrained
+from genrec.quantization.debias.trainer import PopularityDebiasController
 class LETTERRQVAETrainer:
     def __init__(
         self, 
@@ -43,6 +44,14 @@ class LETTERRQVAETrainer:
             os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
             logging.info(f"The best model will be saved based on the best value of '{self.save_best_on}'.")
         self.labels = {"0": [], "1": [], "2": [], "3": [], "4": [], "5": [], "6": []}
+        self.item_popularity = self.config.get('item_popularity', {})
+        self.debias = PopularityDebiasController(
+            self.config,
+            self.optimizer,
+            self.item_popularity,
+            self.device,
+            accelerator=self.accelerator,
+        )
 
         self.cf_emb_path = self.config.get('cf_emb_path')
         if self.cf_emb_path and os.path.exists(self.cf_emb_path):
@@ -182,6 +191,18 @@ class LETTERRQVAETrainer:
             logging.info(f"Collision rate: {collision_rate:.4f}")
             
         return collision_rate
+
+    def _batch_popularity_weights(self, item_ids):
+        return self.debias.batch_weights(item_ids)
+
+    def _scheduled_popularity_balance_weight(self, epoch: int) -> float:
+        return self.debias.scheduled_weight(epoch)
+
+    def _set_popularity_balance_weight(self, weight: float):
+        self.debias.set_weight(weight)
+
+    def _apply_popularity_ema_update(self):
+        self.debias.apply_ema_update()
     def constrained_km(self, data, n_cluster=10):
         x = data
         size_min = min(len(data) // (n_cluster * 2), 10)
@@ -194,7 +215,7 @@ class LETTERRQVAETrainer:
         return t_centers, t_labels
     def _train_one_epoch(self, train_dataloader, epoch: int):
         self.tokenizer.train()
-        total_loss, total_recon_loss, total_commit_loss, total_cf_loss = 0.0, 0.0, 0.0, 0.0
+        total_loss, total_recon_loss, total_commit_loss, total_cf_loss, total_popularity_balance_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{self.epochs} [Training]", leave=False)
 
         embs = [layer.embedding.weight.cpu().detach().numpy() for layer in self.tokenizer.rq_vae.rq.vq_layers]
@@ -211,16 +232,41 @@ class LETTERRQVAETrainer:
                 emb_idx = emb_idx.detach().cpu().numpy()
             cf_embedding_in_batch = self.cf_embedding[emb_idx]
             cf_embedding_in_batch = torch.from_numpy(cf_embedding_in_batch).to(self.device)
-            loss, reconstruction_loss, commit_loss, cf_loss = self.optimizer.compute_loss(embeddings, cf_embedding_in_batch, tokenizer_output)
+            popularity_weights = self._batch_popularity_weights(emb_idx)
+            loss_values = self.optimizer.compute_loss(
+                embeddings,
+                cf_embedding_in_batch,
+                tokenizer_output,
+                popularity_weights=popularity_weights,
+            )
+            if len(loss_values) == 4:
+                loss, reconstruction_loss, commit_loss, cf_loss = loss_values
+                popularity_balance_loss = loss.new_zeros(())
+            else:
+                loss, reconstruction_loss, commit_loss, cf_loss, popularity_balance_loss = loss_values
             loss.backward()
             self.optimizer.step()
+            self._apply_popularity_ema_update()
             total_loss += loss.item()
             total_recon_loss += reconstruction_loss.item()
             total_commit_loss += commit_loss.item()
             total_cf_loss += cf_loss.item()
+            total_popularity_balance_loss += popularity_balance_loss.item()
             if len(progress_bar) % self.log_interval == 0:
-                progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'recon_loss': f'{reconstruction_loss.item():.4f}', 'commit_loss': f'{commit_loss.item():.4f}', 'cf_loss': f'{cf_loss.item():.4f}'})
-        return total_loss / len(train_dataloader), total_recon_loss / len(train_dataloader), total_commit_loss / len(train_dataloader), total_cf_loss / len(train_dataloader)
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'recon_loss': f'{reconstruction_loss.item():.4f}',
+                    'commit_loss': f'{commit_loss.item():.4f}',
+                    'cf_loss': f'{cf_loss.item():.4f}',
+                    'pop_balance_loss': f'{popularity_balance_loss.item():.4f}',
+                })
+        return (
+            total_loss / len(train_dataloader),
+            total_recon_loss / len(train_dataloader),
+            total_commit_loss / len(train_dataloader),
+            total_cf_loss / len(train_dataloader),
+            total_popularity_balance_loss / len(train_dataloader),
+        )
 
 
     def _save_checkpoint(self, epoch, metric_value=None, is_best=False, utilization_rate=None, collision_rate=None):
@@ -264,10 +310,13 @@ class LETTERRQVAETrainer:
         if is_main:
             self._init_tensorboard_writer()
         for epoch in range(self.epochs):
-            train_loss, train_recon, train_commit, train_cf = self._train_one_epoch(train_dataloader, epoch)
+            scheduled_popularity_weight = self._scheduled_popularity_balance_weight(epoch)
+            self._set_popularity_balance_weight(scheduled_popularity_weight)
+            train_loss, train_recon, train_commit, train_cf, train_pop_balance = self._train_one_epoch(train_dataloader, epoch)
             if is_main:
                 logging.info(f"Epoch {epoch+1}/{self.epochs} | Train Loss: {train_loss:.4f} | "
-                         f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f} | Train CF Loss: {train_cf:.4f}")
+                         f"Train Recon Loss: {train_recon:.4f} | Train Commit Loss: {train_commit:.4f} | Train CF Loss: {train_cf:.4f} | "
+                         f"Train Popularity Balance Loss: {train_pop_balance:.4f} | Popularity Balance Weight: {scheduled_popularity_weight:.4e}")
                 self._append_tensorboard_scalars(
                     epoch + 1,
                     train_loss,
