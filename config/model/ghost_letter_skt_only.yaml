@@ -26,7 +26,7 @@ max_gen_length: 8
 weight_decay: 0.2
 warmup_ratio: 0.05
 early_stop_upper_steps: 5
-evaluation_epoch: 1
+evaluation_epoch: 5
 use_user_tokens: false
 tau: 1.0
 ghost_variant: "skt_only"

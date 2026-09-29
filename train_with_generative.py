@@ -10,14 +10,23 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from genrec.utils.nni_utils import get_nni_params, update_config_with_nni
-from genrec.utils.common_utils import infer_tokenizer_kind, set_seed, tokenizer_artifacts_ready
+from genrec.utils.common_utils import infer_tokenizer_kind, set_seed, tokenizer_artifacts_ready, tokens_to_item_id
 from genrec.utils.logging_utils import setup_logging
 from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class, get_tokenizer_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
 from genrec.utils.popularity_metrics import (
     compute_dataset_item_popularity,
     compute_prediction_popularity_metrics,
+    compute_train_item_popularity,
     compute_token_popularity_metrics,
+)
+from genrec.utils.bqs import (
+    DEFAULT_BQS_PENALTIES,
+    DEFAULT_BQS_TEMPERATURE,
+    build_popularity_classes,
+    compute_bqs_metrics,
+    compute_low_popularity_quality_metrics,
+    load_final_metrics,
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -273,8 +282,7 @@ def stage2_train_generation_model(
             seen = set()
             item_ids = []
             for seq in user_sequences:
-                tokens_tuple = tuple(seq.tolist())
-                item_id = tokenizer.tokens2item.get(tokens_tuple, None)
+                item_id = tokens_to_item_id(seq, tokenizer.tokens2item)
                 if item_id is None or item_id in seen:
                     continue
                 seen.add(item_id)
@@ -293,6 +301,57 @@ def stage2_train_generation_model(
         )
         metrics.update({f"test_{key}": value for key, value in popularity_metrics.items()})
         metrics.update({f"test_{key}": value for key, value in token_popularity_metrics.items()})
+
+        low_quality_metrics = {}
+        bqs_metrics = {}
+        bqs_details = {}
+        bqs_context = {}
+        if model_config.get("bqs_enabled", True):
+            train_item_popularity = compute_train_item_popularity(
+                model_config['data_interaction_files'], shift_item_id=0
+            )
+            # Keep items that only occur in validation/test in the catalog with
+            # zero training popularity. This does not leak their held-out count.
+            for item_id in item_popularity:
+                train_item_popularity.setdefault(item_id, 0)
+
+            popularity_classes = build_popularity_classes(train_item_popularity)
+            test_labels = [int(label) for label in test_results.label_ids.reshape(-1).tolist()]
+            low_quality_metrics, test_context = compute_low_popularity_quality_metrics(
+                tiger_predictions,
+                test_labels,
+                popularity_classes.low,
+                k_list=model_config.get("k_list", [1, 5, 10]),
+            )
+            metrics.update({f"test_{key}": value for key, value in low_quality_metrics.items()})
+            bqs_context = popularity_classes.to_context()
+            bqs_context.update(test_context)
+
+            penalties = {
+                "hit": float(model_config.get("bqs_hit_penalty", DEFAULT_BQS_PENALTIES["hit"])),
+                "ndcg": float(model_config.get("bqs_ndcg_penalty", DEFAULT_BQS_PENALTIES["ndcg"])),
+            }
+            bqs_temperature = float(
+                model_config.get("bqs_temperature", DEFAULT_BQS_TEMPERATURE)
+            )
+            bqs_context["penalties"] = penalties
+            bqs_context["temperature"] = bqs_temperature
+            baseline_metrics_path = model_config.get("bqs_baseline_metrics_path")
+            if baseline_metrics_path:
+                baseline_final_metrics = load_final_metrics(baseline_metrics_path)
+                candidate_record = {
+                    "dataset": model_config.get("dataset_name"),
+                    "metrics": metrics,
+                    "bqs_context": bqs_context,
+                }
+                bqs_metrics, bqs_details = compute_bqs_metrics(
+                    candidate_record,
+                    baseline_final_metrics,
+                    k_list=model_config.get("k_list", [1, 5, 10]),
+                    penalties=penalties,
+                    temperature=bqs_temperature,
+                )
+                metrics.update({f"test_{key}": value for key, value in bqs_metrics.items()})
 
         k_values = sorted(
             list(
@@ -315,6 +374,10 @@ def stage2_train_generation_model(
             logger.info(f"{key}: {value:.4f}")
         for key, value in token_popularity_metrics.items():
             logger.info(f"{key}: {value:.4f}")
+        for key, value in low_quality_metrics.items():
+            logger.info(f"{key}: {value:.4f}")
+        for key, value in bqs_metrics.items():
+            logger.info(f"{key}: {value:.4f}")
 
         logger.info("=" * 75)
         final_metrics = {
@@ -329,6 +392,12 @@ def stage2_train_generation_model(
             "metrics": {key: float(value) for key, value in metrics.items()},
             "popularity_metrics": {key: float(value) for key, value in popularity_metrics.items()},
             "token_popularity_metrics": {key: float(value) for key, value in token_popularity_metrics.items()},
+            "low_popularity_quality_metrics": {
+                key: float(value) for key, value in low_quality_metrics.items()
+            },
+            "bqs_metrics": {key: float(value) for key, value in bqs_metrics.items()},
+            "bqs_details": bqs_details,
+            "bqs_context": bqs_context,
             "config": {
                 "learning_rate": model_config.get("learning_rate"),
                 "weight_decay": model_config.get("weight_decay"),
@@ -347,6 +416,17 @@ def stage2_train_generation_model(
                 "num_heads": model_config.get("num_heads"),
                 "dropout_rate": model_config.get("dropout_rate"),
                 "tie_word_embeddings": model_config.get("tie_word_embeddings"),
+                "bqs_enabled": model_config.get("bqs_enabled", True),
+                "bqs_baseline_metrics_path": model_config.get("bqs_baseline_metrics_path"),
+                "bqs_hit_penalty": model_config.get(
+                    "bqs_hit_penalty", DEFAULT_BQS_PENALTIES["hit"]
+                ),
+                "bqs_ndcg_penalty": model_config.get(
+                    "bqs_ndcg_penalty", DEFAULT_BQS_PENALTIES["ndcg"]
+                ),
+                "bqs_temperature": model_config.get(
+                    "bqs_temperature", DEFAULT_BQS_TEMPERATURE
+                ),
             },
         }
         final_metrics_path = os.path.join(output_dirs['base'], "final_metrics.json")

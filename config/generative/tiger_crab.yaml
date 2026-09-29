@@ -1,0 +1,6 @@
+type: "tiger_crab"
+trainer:
+  _target_: genrec.trainers.generative.crab_trainer.CrabTigerTrainer
+  _partial_: true
+  sid_length: 4
+  gamma: 0.2

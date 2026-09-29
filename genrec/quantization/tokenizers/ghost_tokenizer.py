@@ -23,9 +23,9 @@ class GhostSKTTokenizer(AbstractTokenizer):
 
         self.pad_token = 0
         self.eos_token = 1
+        self.bos_token = self.pad_token
         self.reserve_tokens = int(self.config.get("reserve_tokens", 2))
         self.num_user_tokens = 0
-        self.user_token_start_idx = None
         self.ignored_label = -100
 
         self.head_ratio = float(self.config.get("head_ratio", 0.2))
@@ -33,6 +33,11 @@ class GhostSKTTokenizer(AbstractTokenizer):
         self.tail_extra_length = int(self.config.get("tail_extra_length", 2))
         self.semantic_dim = int(self.config.get("semantic_dim", 32))
         self.codebook_size = int(self.config.get("codebook_size", 256))
+        # The shared dataset/backbone contract expects the maximum number of
+        # codebook positions, while individual GHOST items may be shorter.
+        self.n_codebooks = self.skeleton_length + self.tail_extra_length
+        self.digits = self.n_codebooks
+        self.user_token_start_idx = self._item_vocab_size()
         self.projection_method = str(self.config.get("projection_method", "pca")).lower()
         self.random_state = int(self.config.get("seed", self.config.get("random_state", 42)))
         self.kmeans_n_init = self.config.get("kmeans_n_init", "auto")
@@ -76,9 +81,12 @@ class GhostSKTTokenizer(AbstractTokenizer):
     def total_sid_length(self) -> int:
         return self.skeleton_length + self.tail_extra_length
 
+    def _item_vocab_size(self) -> int:
+        return self.reserve_tokens + self.total_sid_length * self.codebook_size
+
     @property
     def vocab_size(self) -> int:
-        return self.reserve_tokens + self.total_sid_length * self.codebook_size
+        return self._item_vocab_size() + self.num_user_tokens
 
     @property
     def max_token_seq_len(self) -> int:
@@ -382,6 +390,10 @@ class GhostSKTTokenizer(AbstractTokenizer):
             "codebook_size": self.codebook_size,
             "projection_method": self.projection_method,
             "reserve_tokens": self.reserve_tokens,
+            "n_codebooks": self.n_codebooks,
+            "digits": self.digits,
+            "num_user_tokens": self.num_user_tokens,
+            "user_token_start_idx": self.user_token_start_idx,
             "vocab_size": self.vocab_size,
             "head_item_ids": self.head_item_ids,
             "tail_item_ids": self.tail_item_ids,
@@ -402,6 +414,18 @@ class GhostSKTTokenizer(AbstractTokenizer):
         self.semantic_dim = int(metadata.get("semantic_dim", self.semantic_dim))
         self.codebook_size = int(metadata.get("codebook_size", self.codebook_size))
         self.reserve_tokens = int(metadata.get("reserve_tokens", self.reserve_tokens))
+        # Recompute compatibility fields from the restored variable-length SID
+        # configuration. Older GHOST artifacts do not contain these fields.
+        self.n_codebooks = self.skeleton_length + self.tail_extra_length
+        self.digits = self.n_codebooks
+        self.num_user_tokens = int(metadata.get("num_user_tokens", 0))
+        expected_user_start = self._item_vocab_size()
+        stored_user_start = metadata.get("user_token_start_idx")
+        self.user_token_start_idx = int(
+            stored_user_start if stored_user_start is not None else expected_user_start
+        )
+        if self.num_user_tokens == 0:
+            self.user_token_start_idx = expected_user_start
         self.head_item_ids = [int(item_id) for item_id in metadata.get("head_item_ids", [])]
         self.tail_item_ids = [int(item_id) for item_id in metadata.get("tail_item_ids", [])]
         self.item_lengths = {int(item_id): int(length) for item_id, length in metadata.get("item_lengths", {}).items()}
@@ -438,4 +462,3 @@ class GhostSKTTokenizer(AbstractTokenizer):
 
     def is_tail_item(self, item_id: int) -> bool:
         return int(item_id) in set(self.tail_item_ids)
-

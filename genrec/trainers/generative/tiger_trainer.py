@@ -102,7 +102,13 @@ class TigerTrainer(BaseGenerativeTrainer):
         
         # Build Trie for constrained generation
         if self.item2tokens:
-            self.candidate_trie = Trie(self.item2tokens)
+            sid_lengths = {len(tokens) for tokens in self.item2tokens.values()}
+            variable_length_sids = len(sid_lengths) > 1
+            self.candidate_trie = Trie(
+                self.item2tokens,
+                eos_token_id=self.eos_token_id,
+                append_eos=variable_length_sids,
+            )
             if self.inference_mode == "CBS":
                 self.prefix_allowed_fn = prefix_allowed_tokens_fn(self.candidate_trie)
             if self.inference_mode == "FastCBS":

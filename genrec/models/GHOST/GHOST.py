@@ -25,6 +25,77 @@ class GhostAuoMixin:
         self.auo_temperature = float(getattr(config, "auo_temperature", 1.0))
         self.ghost_collection_path = getattr(config, "ghost_collection_path", None)
         self.ghost_collection = self._load_ghost_collection(self.ghost_collection_path)
+        self._build_auo_candidate_cache()
+
+    def _build_auo_candidate_cache(self) -> None:
+        """Build a dense, device-movable cache for static AUO candidates.
+
+        The previous implementation parsed the JSON collection and created
+        Python lists for every batch.  Candidate order and padding are kept
+        identical here, but item IDs can now index the prepared tensors
+        directly during the forward pass.
+        """
+        if not self.ghost_collection or self.auo_kb <= 0:
+            self.register_buffer(
+                "_auo_candidate_labels",
+                torch.empty((0, 0, 0), dtype=torch.long),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_auo_candidate_valid",
+                torch.empty((0, 0), dtype=torch.bool),
+                persistent=True,
+            )
+            return
+
+        entries: dict[int, list[list[int]]] = {}
+        max_item_id = -1
+        max_sequence_length = 0
+        eos_token_id = int(self.config.eos_token_id)
+        for raw_item_id, entry in self.ghost_collection.items():
+            try:
+                item_id = int(raw_item_id)
+            except (TypeError, ValueError):
+                continue
+            if item_id < 0 or not isinstance(entry, dict):
+                continue
+            candidates: list[list[int]] = []
+            for sid in entry.get("head_sids", [])[: self.auo_kb]:
+                sequence = [int(token) for token in sid]
+                sequence.append(eos_token_id)
+                candidates.append(sequence)
+                max_sequence_length = max(max_sequence_length, len(sequence))
+            entries[item_id] = candidates
+            max_item_id = max(max_item_id, item_id)
+
+        if max_item_id < 0 or max_sequence_length == 0:
+            self.register_buffer(
+                "_auo_candidate_labels",
+                torch.empty((0, 0, 0), dtype=torch.long),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_auo_candidate_valid",
+                torch.empty((0, 0), dtype=torch.bool),
+                persistent=True,
+            )
+            return
+
+        labels = torch.full(
+            (max_item_id + 1, self.auo_kb, max_sequence_length),
+            -100,
+            dtype=torch.long,
+        )
+        valid = torch.zeros((max_item_id + 1, self.auo_kb), dtype=torch.bool)
+        for item_id, candidates in entries.items():
+            for candidate_index, sequence in enumerate(candidates):
+                labels[item_id, candidate_index, : len(sequence)] = torch.tensor(
+                    sequence, dtype=torch.long
+                )
+                valid[item_id, candidate_index] = True
+
+        self.register_buffer("_auo_candidate_labels", labels, persistent=True)
+        self.register_buffer("_auo_candidate_valid", valid, persistent=True)
 
     @staticmethod
     def _load_ghost_collection(path: Optional[str]) -> dict[str, Any]:
@@ -123,14 +194,36 @@ class GhostAuoMixin:
         if self.auo_alpha <= 0.0 or not self.ghost_collection:
             return encoder_memory.new_tensor(0.0)
 
-        batch_indices, candidate_sequences = self._candidate_sequences_for_batch(item_ids, target_is_tail)
-        if not candidate_sequences:
+        if item_ids is None or self._auo_candidate_labels.numel() == 0:
             return encoder_memory.new_tensor(0.0)
 
-        index_tensor = torch.tensor(batch_indices, dtype=torch.long, device=encoder_memory.device)
-        expanded_memory = encoder_memory.index_select(0, index_tensor)
-        expanded_mask = encoder_attention_mask.index_select(0, index_tensor)
-        candidate_labels = self._pad_candidate_labels(candidate_sequences, encoder_memory.device)
+        item_ids = item_ids.to(device=encoder_memory.device, dtype=torch.long).reshape(-1)
+        batch_size = item_ids.size(0)
+        cache_size = self._auo_candidate_labels.size(0)
+        in_range = (item_ids >= 0) & (item_ids < cache_size)
+        safe_item_ids = item_ids.clamp(min=0, max=cache_size - 1)
+        candidate_labels = self._auo_candidate_labels.index_select(0, safe_item_ids)
+        candidate_valid = self._auo_candidate_valid.index_select(0, safe_item_ids)
+        if target_is_tail is not None:
+            tail_mask = target_is_tail.to(device=encoder_memory.device).reshape(-1).bool()
+            candidate_valid = candidate_valid & tail_mask.unsqueeze(1)
+        candidate_valid = candidate_valid & in_range.unsqueeze(1)
+        valid_rows = candidate_valid.reshape(-1)
+        if not valid_rows.any():
+            return encoder_memory.new_tensor(0.0)
+
+        candidate_labels = candidate_labels.reshape(batch_size * self.auo_kb, -1)
+        candidate_labels = candidate_labels[valid_rows]
+        expanded_memory = (
+            encoder_memory.unsqueeze(1)
+            .expand(-1, self.auo_kb, -1, -1)
+            .reshape(batch_size * self.auo_kb, encoder_memory.size(1), encoder_memory.size(2))
+        )[valid_rows]
+        expanded_mask = (
+            encoder_attention_mask.unsqueeze(1)
+            .expand(-1, self.auo_kb, -1)
+            .reshape(batch_size * self.auo_kb, encoder_attention_mask.size(1))
+        )[valid_rows]
         logits = self._decode_logits_from_labels(
             encoder_memory=expanded_memory,
             encoder_attention_mask=expanded_mask,

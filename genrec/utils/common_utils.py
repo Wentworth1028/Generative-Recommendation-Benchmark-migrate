@@ -6,7 +6,7 @@ import random
 import numpy as np
 import torch
 
-from genrec.ghost.utils import infer_tokenizer_kind
+from genrec.ghost.utils import infer_tokenizer_kind, tokens_key
 
 
 def load_json_file(file_path):
@@ -26,7 +26,7 @@ def tokens_to_item_id(
     else:
         tokens_list = tokens_sequence
 
-    tokens_tuple = tuple(tokens_list)
+    tokens_tuple = tokens_key(tokens_list)
     return tokens_to_item_map.get(tokens_tuple, None)
 
 

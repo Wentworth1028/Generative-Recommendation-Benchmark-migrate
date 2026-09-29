@@ -26,9 +26,17 @@ max_gen_length: 5
 weight_decay: 0.2
 warmup_ratio: 0.05
 early_stop_upper_steps: 5
-evaluation_epoch: 1
+evaluation_epoch: 5
 use_user_tokens: false
 tau: 1.0
+# BQS uses paper-style popularity elbows computed from training interactions.
+# A candidate only receives BQS values when this points to a baseline run that
+# was evaluated with BQS enabled; baseline runs still record HR_L/NDCG_L.
+bqs_enabled: true
+bqs_baseline_metrics_path: null
+bqs_hit_penalty: 10.0
+bqs_ndcg_penalty: 2.0
+bqs_temperature: 0.1
 care_sid_length: 4
 care_query_numbers: [1, 1, 4, 4]
 care_alpha: 0.7

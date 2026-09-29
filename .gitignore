@@ -18,6 +18,7 @@
 /auto_hyper/
 /data/
 /backed/
+/tests/
 
 .vscode/
 # poetry
