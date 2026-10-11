@@ -1,0 +1,13 @@
+# DROS keeps the LETTER tokenizer, backbone, NLL, and constrained decoding.
+type: "letter_dros"
+trainer:
+  _target_: genrec.trainers.generative.dros_trainer.DROSLetterTrainer
+  _partial_: true
+  dros_temperature: 0.5
+  dros_weight: 0.1
+  popularity_temperature: 0.05
+  num_negative_samples: 5
+  score_transform: "sigmoid"
+  popularity_scope: "model_window"
+  item_pooling: "mean"
+  exclude_eos_from_user: true

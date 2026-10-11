@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from genrec.data.collators.generative.ghost_collator import GhostDataCollator
+from genrec.data.collators.generative.dros_collator import DROSTigerDataCollator
 from genrec.data.collators.generative.tiger_collator import TigerDataCollator
+from genrec.data.datasets.generative.dros_dataset import DROSTigerDataset
 from genrec.data.datasets.generative.ghost_dataset import GhostDataset
 from genrec.data.datasets.generative.tiger_dataset import TigerDataset
 from genrec.quantization.pipelines.ghost_pipeline import GhostSKTTrainingPipeline
@@ -19,7 +21,13 @@ from genrec.utils.models_setup.twmtl_setup import create_twmtl_letter_model, cre
 
 MODEL_FACTORY = {
     "tiger": create_tiger_model,
+    "tiger_resn": create_tiger_model,
+    "tiger_logdet": create_tiger_model,
+    "tiger_dros": create_tiger_model,
     "letter": create_letter_model,
+    "letter_resn": create_letter_model,
+    "letter_logdet": create_letter_model,
+    "letter_dros": create_letter_model,
     "tiger_twmtl": create_twmtl_tiger_model,
     "letter_twmtl": create_twmtl_letter_model,
     "tiger_care": create_care_tiger_model,
@@ -34,7 +42,13 @@ MODEL_FACTORY = {
 
 DATASET_MAP = {
     "tiger": TigerDataset,
+    "tiger_resn": TigerDataset,
+    "tiger_logdet": TigerDataset,
+    "tiger_dros": DROSTigerDataset,
     "letter": TigerDataset,
+    "letter_resn": TigerDataset,
+    "letter_logdet": TigerDataset,
+    "letter_dros": DROSTigerDataset,
     "tiger_twmtl": TigerDataset,
     "letter_twmtl": TigerDataset,
     "tiger_care": TigerDataset,
@@ -49,7 +63,13 @@ DATASET_MAP = {
 
 COLLATOR_MAP = {
     "tiger": TigerDataCollator,
+    "tiger_resn": TigerDataCollator,
+    "tiger_logdet": TigerDataCollator,
+    "tiger_dros": DROSTigerDataCollator,
     "letter": TigerDataCollator,
+    "letter_resn": TigerDataCollator,
+    "letter_logdet": TigerDataCollator,
+    "letter_dros": DROSTigerDataCollator,
     "tiger_twmtl": TigerDataCollator,
     "letter_twmtl": TigerDataCollator,
     "tiger_care": TigerDataCollator,
@@ -64,7 +84,13 @@ COLLATOR_MAP = {
 
 PIPELINE_MAP = {
     "tiger": RQVAETrainingPipeline,
+    "tiger_resn": RQVAETrainingPipeline,
+    "tiger_logdet": RQVAETrainingPipeline,
+    "tiger_dros": RQVAETrainingPipeline,
     "letter": LETTERRQVAETrainingPipeline,
+    "letter_resn": LETTERRQVAETrainingPipeline,
+    "letter_logdet": LETTERRQVAETrainingPipeline,
+    "letter_dros": LETTERRQVAETrainingPipeline,
     "ghost": GhostSKTTrainingPipeline,
     "ghost_tiger": GhostSKTTrainingPipeline,
     "ghost_letter": GhostSKTTrainingPipeline,

@@ -1,0 +1,9 @@
+# ReSN keeps the LETTER tokenizer, backbone, NLL, and constrained decoding.
+type: "letter_resn"
+trainer:
+  _target_: genrec.trainers.generative.resn_trainer.ReSNLetterTrainer
+  _partial_: true
+  resn_weight: 1e-4
+  eps: 1e-8
+  item_pooling: "mean"
+  exclude_eos_from_user: true

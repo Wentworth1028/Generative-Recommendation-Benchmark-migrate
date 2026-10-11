@@ -1,0 +1,11 @@
+# LogDet keeps the LETTER tokenizer, backbone, NLL, and constrained decoding.
+type: "letter_logdet"
+trainer:
+  _target_: genrec.trainers.generative.logdet_trainer.LogDetLetterTrainer
+  _partial_: true
+  logdet_user_weight: 0.0
+  logdet_item_weight: 0.001
+  jitter: 1e-6
+  item_pooling: "mean"
+  exclude_eos_from_user: true
+  include_dimension_constant: false
