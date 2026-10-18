@@ -29,6 +29,27 @@ def setup_training(
     vocab_size: Optional[int] = None,
 ):
 
+    dataloader_num_workers = int(model_config.get("dataloader_num_workers", 0))
+    dataloader_persistent_workers = bool(
+        model_config.get("dataloader_persistent_workers", False)
+    )
+    dataloader_prefetch_factor = model_config.get("dataloader_prefetch_factor")
+    if dataloader_num_workers < 0:
+        raise ValueError("dataloader_num_workers must be non-negative.")
+    if dataloader_num_workers == 0:
+        if dataloader_persistent_workers:
+            raise ValueError(
+                "dataloader_persistent_workers requires dataloader_num_workers > 0."
+            )
+        if dataloader_prefetch_factor is not None:
+            raise ValueError(
+                "dataloader_prefetch_factor requires dataloader_num_workers > 0."
+            )
+    elif dataloader_prefetch_factor is not None:
+        dataloader_prefetch_factor = int(dataloader_prefetch_factor)
+        if dataloader_prefetch_factor <= 0:
+            raise ValueError("dataloader_prefetch_factor must be positive.")
+
     training_args = TrainingArguments(
         lr_scheduler_type="cosine",
         output_dir=output_dirs['model'],
@@ -51,6 +72,10 @@ def setup_training(
         greater_is_better=True,
         seed=model_config.get("seed", 42),
         data_seed=model_config.get("seed", 42),
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_pin_memory=bool(model_config.get("dataloader_pin_memory", True)),
+        dataloader_persistent_workers=dataloader_persistent_workers,
+        dataloader_prefetch_factor=dataloader_prefetch_factor,
     )
 
     tokens_to_item_map = tokenizer.tokens2item
@@ -71,6 +96,9 @@ def setup_training(
         DelayedEvaluateEveryNEpochsCallback(
             n_epochs=model_config.get("evaluation_epoch", 5),
             start_epoch=model_config.get("evaluation_start_epoch", 40),
+            save_on_evaluation_only=bool(
+                model_config.get("save_on_evaluation_only", False)
+            ),
         ),
     ]
 

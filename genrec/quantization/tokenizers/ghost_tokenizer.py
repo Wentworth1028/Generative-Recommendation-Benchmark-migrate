@@ -17,6 +17,8 @@ from genrec.quantization.tokenizers.base_tokenizer import AbstractTokenizer
 class GhostSKTTokenizer(AbstractTokenizer):
     """Skeleton-founded tokenizer used by GHOST and SKT-only variants."""
 
+    ARTIFACT_VERSION = 2
+
     def __init__(self, config: dict):
         super().__init__(config)
         self.config = dict(config)
@@ -42,8 +44,24 @@ class GhostSKTTokenizer(AbstractTokenizer):
         self.random_state = int(self.config.get("seed", self.config.get("random_state", 42)))
         self.kmeans_n_init = self.config.get("kmeans_n_init", "auto")
         self.kmeans_max_iter = int(self.config.get("kmeans_max_iter", 100))
+        self.collision_repair_enabled = bool(self.config.get("collision_repair_enabled", True))
+        self.collision_candidates_per_layer = int(self.config.get("collision_candidates_per_layer", 8))
+        self.collision_beam_width = int(self.config.get("collision_beam_width", 256))
         self.auo_ka = int(self.config.get("auo_ka", 200))
         self.auo_kb = int(self.config.get("auo_kb", 5))
+
+        if not 0.0 < self.head_ratio < 1.0:
+            raise ValueError(f"GHOST head_ratio must be in (0, 1), got {self.head_ratio}.")
+        if self.skeleton_length <= 0 or self.tail_extra_length <= 0:
+            raise ValueError("GHOST skeleton_length and tail_extra_length must be positive.")
+        if self.semantic_dim <= 0 or self.codebook_size <= 1:
+            raise ValueError("GHOST semantic_dim must be positive and codebook_size must exceed one.")
+        if self.reserve_tokens < 2:
+            raise ValueError("GHOST must reserve at least PAD and EOS tokens.")
+        if self.auo_ka <= 0 or self.auo_kb <= 0 or self.auo_kb > self.auo_ka:
+            raise ValueError("GHOST requires 0 < auo_kb <= auo_ka.")
+        if self.collision_candidates_per_layer <= 0 or self.collision_beam_width <= 0:
+            raise ValueError("GHOST collision search widths must be positive.")
 
         self.item2tokens: Dict[int, list[int]] = {}
         self.tokens2item: Dict[tuple[int, ...], int] = {}
@@ -83,6 +101,98 @@ class GhostSKTTokenizer(AbstractTokenizer):
 
     def _item_vocab_size(self) -> int:
         return self.reserve_tokens + self.total_sid_length * self.codebook_size
+
+    def _codes_to_tokens(self, codes: Iterable[int], *, start_layer: int = 0) -> list[int]:
+        return [
+            int(code) + self.reserve_tokens + (start_layer + layer_idx) * self.codebook_size
+            for layer_idx, code in enumerate(codes)
+        ]
+
+    def _find_unique_codes(
+        self,
+        vector: np.ndarray,
+        codebooks: np.ndarray,
+        preferred_codes: Iterable[int],
+        used_codes: set[tuple[int, ...]],
+        *,
+        valid_centers: int,
+        context: str,
+    ) -> np.ndarray:
+        """Find the nearest unused residual-quantization path with a small beam.
+
+        RQ-KMeans does not guarantee unique code tuples. GHOST needs an
+        invertible SID-to-item map, so only colliding items are reassigned to
+        the closest available path under the already fitted codebooks.
+        """
+        preferred = tuple(int(code) for code in preferred_codes)
+        if preferred not in used_codes:
+            return np.asarray(preferred, dtype=np.int64)
+        if not self.collision_repair_enabled:
+            raise ValueError(f"Duplicate GHOST SID in {context}: {preferred}.")
+
+        valid_centers = max(1, min(int(valid_centers), self.codebook_size))
+        candidate_widths = []
+        width = min(self.collision_candidates_per_layer, valid_centers)
+        while width < valid_centers:
+            candidate_widths.append(width)
+            width = min(valid_centers, width * 2)
+        candidate_widths.append(valid_centers)
+
+        for candidate_width in candidate_widths:
+            beams: list[tuple[float, tuple[int, ...], np.ndarray]] = [
+                (float(np.dot(vector, vector)), tuple(), vector.astype(np.float32, copy=True))
+            ]
+            for layer_idx in range(codebooks.shape[0]):
+                centers = codebooks[layer_idx, :valid_centers]
+                expanded: list[tuple[float, tuple[int, ...], np.ndarray]] = []
+                for _, prefix, residual in beams:
+                    distances = ((centers - residual[None, :]) ** 2).sum(axis=1)
+                    if candidate_width < valid_centers:
+                        nearest = np.argpartition(distances, candidate_width - 1)[:candidate_width]
+                    else:
+                        nearest = np.arange(valid_centers)
+                    nearest = nearest[np.argsort(distances[nearest], kind="stable")]
+                    for code in nearest:
+                        next_residual = residual - centers[int(code)]
+                        score = float(np.dot(next_residual, next_residual))
+                        expanded.append((score, prefix + (int(code),), next_residual))
+                expanded.sort(key=lambda entry: (entry[0], entry[1]))
+                beams = expanded[: self.collision_beam_width]
+
+            for _, codes, _ in beams:
+                if codes not in used_codes:
+                    return np.asarray(codes, dtype=np.int64)
+
+        raise ValueError(
+            f"Unable to assign a unique GHOST SID in {context}; increase "
+            "codebook_size/tail_extra_length or collision_beam_width."
+        )
+
+    def _deduplicate_codes(
+        self,
+        vectors: np.ndarray,
+        codebooks: np.ndarray,
+        codes: np.ndarray,
+        *,
+        valid_centers: int,
+        context: str,
+        group_keys: list[tuple[int, ...]] | None = None,
+    ) -> np.ndarray:
+        repaired = codes.astype(np.int64, copy=True)
+        used_by_group: dict[tuple[int, ...], set[tuple[int, ...]]] = {}
+        for row_idx in range(repaired.shape[0]):
+            group = group_keys[row_idx] if group_keys is not None else tuple()
+            used = used_by_group.setdefault(group, set())
+            repaired[row_idx] = self._find_unique_codes(
+                vectors[row_idx],
+                codebooks,
+                repaired[row_idx],
+                used,
+                valid_centers=valid_centers,
+                context=f"{context} group={group}",
+            )
+            used.add(tuple(int(code) for code in repaired[row_idx]))
+        return repaired
 
     @property
     def vocab_size(self) -> int:
@@ -218,7 +328,7 @@ class GhostSKTTokenizer(AbstractTokenizer):
         )
         if not ranked:
             return [], []
-        head_count = int(round(len(ranked) * self.head_ratio))
+        head_count = int(len(ranked) * self.head_ratio)
         head_count = max(1, min(head_count, len(ranked) - 1 if len(ranked) > 1 else 1))
         head_items = [item_id for item_id, _ in ranked[:head_count]]
         tail_items = [item_id for item_id, _ in ranked[head_count:]]
@@ -287,6 +397,8 @@ class GhostSKTTokenizer(AbstractTokenizer):
             self._restore_metadata(metadata)
             collection = self._load_json_if_exists(self.undesired_collection_path) or {}
             self.undesired_collection = collection
+            self._validate_tokenization()
+            self._validate_undesired_collection()
             return
 
         item_ids, embeddings = item_embeddings_data
@@ -310,6 +422,13 @@ class GhostSKTTokenizer(AbstractTokenizer):
             self.skeleton_length,
             seed_offset=0,
         )
+        head_codes = self._deduplicate_codes(
+            head_vectors,
+            head_codebooks,
+            head_codes,
+            valid_centers=min(self.codebook_size, len(head_items)),
+            context="head",
+        )
         self.head_codebooks = head_codebooks
 
         self.item2tokens = {}
@@ -317,7 +436,7 @@ class GhostSKTTokenizer(AbstractTokenizer):
         head_code_map: dict[int, np.ndarray] = {}
         for pos, item_id in enumerate(head_items):
             tokens = head_codes[pos].tolist()
-            self.item2tokens[item_id] = [int(token) + self.reserve_tokens + layer_idx * self.codebook_size for layer_idx, token in enumerate(tokens)]
+            self.item2tokens[item_id] = self._codes_to_tokens(tokens)
             self.item_lengths[item_id] = self.skeleton_length
             head_code_map[item_id] = head_codes[pos]
 
@@ -348,22 +467,32 @@ class GhostSKTTokenizer(AbstractTokenizer):
                 self.tail_extra_length,
                 seed_offset=1024,
             )
+            tail_codes = self._deduplicate_codes(
+                tail_residuals,
+                tail_codebooks,
+                tail_codes,
+                valid_centers=min(self.codebook_size, len(tail_items)),
+                context="tail",
+                group_keys=[tuple(int(code) for code in prefix) for prefix in tail_prefix_codes],
+            )
             self.tail_codebooks = tail_codebooks
 
             for pos, item_id in enumerate(tail_items):
-                prefix_tokens = tail_prefix_codes[pos].tolist()
-                extra_tokens = tail_codes[pos].tolist()
-                all_tokens = prefix_tokens + [
-                    int(token) + self.reserve_tokens + (self.skeleton_length + layer_idx) * self.codebook_size
-                    for layer_idx, token in enumerate(extra_tokens)
-                ]
+                prefix_tokens = self._codes_to_tokens(tail_prefix_codes[pos])
+                extra_tokens = self._codes_to_tokens(
+                    tail_codes[pos],
+                    start_layer=self.skeleton_length,
+                )
+                all_tokens = prefix_tokens + extra_tokens
                 self.item2tokens[item_id] = all_tokens
                 self.item_lengths[item_id] = self.total_sid_length
         else:
             self.tail_codebooks = np.zeros((self.tail_extra_length, self.codebook_size, self.semantic_dim), dtype=np.float32)
 
+        self._validate_tokenization()
         self.tokens2item = {tuple(tokens): item_id for item_id, tokens in self.item2tokens.items()}
         self.undesired_collection = self._build_undesired_collection(head_items, tail_items, projected_embeddings, item_index)
+        self._validate_undesired_collection()
 
         self._persist_artifacts(item_ids, projected_embeddings)
 
@@ -383,11 +512,14 @@ class GhostSKTTokenizer(AbstractTokenizer):
 
     def _build_metadata(self) -> dict[str, Any]:
         metadata = {
+            "artifact_version": self.ARTIFACT_VERSION,
             "head_ratio": self.head_ratio,
             "skeleton_length": self.skeleton_length,
             "tail_extra_length": self.tail_extra_length,
             "semantic_dim": self.semantic_dim,
             "codebook_size": self.codebook_size,
+            "auo_ka": self.auo_ka,
+            "auo_kb": self.auo_kb,
             "projection_method": self.projection_method,
             "reserve_tokens": self.reserve_tokens,
             "n_codebooks": self.n_codebooks,
@@ -399,6 +531,12 @@ class GhostSKTTokenizer(AbstractTokenizer):
             "tail_item_ids": self.tail_item_ids,
             "item_lengths": self.item_lengths,
             "nearest_head": self.nearest_head,
+            "collision_repair": {
+                "enabled": self.collision_repair_enabled,
+                "candidates_per_layer": self.collision_candidates_per_layer,
+                "beam_width": self.collision_beam_width,
+                "strategy": "nearest unused residual path within fixed SID length",
+            },
             "projector_state": {
                 key: (value.tolist() if isinstance(value, np.ndarray) else value)
                 for key, value in self.projector_state.items()
@@ -408,11 +546,20 @@ class GhostSKTTokenizer(AbstractTokenizer):
         return metadata
 
     def _restore_metadata(self, metadata: dict[str, Any]) -> None:
+        artifact_version = int(metadata.get("artifact_version", 0))
+        if artifact_version != self.ARTIFACT_VERSION and not bool(self.config.get("allow_legacy_artifacts", False)):
+            raise ValueError(
+                "Incompatible GHOST tokenizer artifact. Version 1 artifacts contain "
+                "an invalid un-offset tail prefix and must be rebuilt; expected "
+                f"artifact_version={self.ARTIFACT_VERSION}, got {artifact_version}."
+            )
         self.head_ratio = float(metadata.get("head_ratio", self.head_ratio))
         self.skeleton_length = int(metadata.get("skeleton_length", self.skeleton_length))
         self.tail_extra_length = int(metadata.get("tail_extra_length", self.tail_extra_length))
         self.semantic_dim = int(metadata.get("semantic_dim", self.semantic_dim))
         self.codebook_size = int(metadata.get("codebook_size", self.codebook_size))
+        self.auo_ka = int(metadata.get("auo_ka", self.auo_ka))
+        self.auo_kb = int(metadata.get("auo_kb", self.auo_kb))
         self.reserve_tokens = int(metadata.get("reserve_tokens", self.reserve_tokens))
         # Recompute compatibility fields from the restored variable-length SID
         # configuration. Older GHOST artifacts do not contain these fields.
@@ -439,6 +586,73 @@ class GhostSKTTokenizer(AbstractTokenizer):
         if Path(self.tail_codebook_path).exists():
             self.tail_codebooks = np.load(self.tail_codebook_path, allow_pickle=True)
 
+    def _validate_tokenization(self) -> None:
+        head_items = set(self.head_item_ids)
+        tail_items = set(self.tail_item_ids)
+        if head_items & tail_items:
+            raise ValueError("GHOST head and tail item partitions overlap.")
+        if set(self.item2tokens) != head_items | tail_items:
+            raise ValueError("GHOST item mapping does not match the head/tail partition.")
+
+        seen: dict[tuple[int, ...], int] = {}
+        for item_id, tokens in self.item2tokens.items():
+            expected_length = self.total_sid_length if item_id in tail_items else self.skeleton_length
+            if len(tokens) != expected_length:
+                raise ValueError(
+                    f"GHOST item {item_id} has SID length {len(tokens)}, expected {expected_length}."
+                )
+            for layer_idx, token in enumerate(tokens):
+                lower = self.reserve_tokens + layer_idx * self.codebook_size
+                upper = lower + self.codebook_size
+                if not lower <= int(token) < upper:
+                    raise ValueError(
+                        f"GHOST item {item_id} token {token} at layer {layer_idx} "
+                        f"is outside [{lower}, {upper})."
+                    )
+            key = tuple(int(token) for token in tokens)
+            if key in seen:
+                raise ValueError(f"Duplicate GHOST SID for items {seen[key]} and {item_id}: {key}.")
+            seen[key] = int(item_id)
+
+        for tail_item in tail_items:
+            if tail_item not in self.nearest_head:
+                raise ValueError(f"GHOST tail item {tail_item} has no nearest head item.")
+            head_item = self.nearest_head[tail_item]
+            if head_item not in head_items:
+                raise ValueError(f"GHOST tail item {tail_item} references non-head item {head_item}.")
+            if self.item2tokens[tail_item][: self.skeleton_length] != self.item2tokens[head_item]:
+                raise ValueError(
+                    f"GHOST tail item {tail_item} does not inherit nearest head {head_item}'s SID."
+                )
+
+    def _validate_undesired_collection(self) -> None:
+        head_items = set(self.head_item_ids)
+        expected_count = min(self.auo_kb, self.auo_ka, len(head_items))
+        for tail_item in self.tail_item_ids:
+            entry = self.undesired_collection.get(str(int(tail_item)))
+            if entry is None:
+                raise ValueError(f"GHOST tail item {tail_item} has no AUO collection entry.")
+            candidate_ids = [int(item_id) for item_id in entry.get("head_item_ids", [])]
+            candidate_sids = entry.get("head_sids", [])
+            lcp_values = [int(value) for value in entry.get("lcp", [])]
+            if len(candidate_ids) != expected_count:
+                raise ValueError(
+                    f"GHOST tail item {tail_item} has {len(candidate_ids)} AUO candidates, "
+                    f"expected {expected_count}."
+                )
+            if not (len(candidate_sids) == len(candidate_ids) == len(lcp_values)):
+                raise ValueError(f"GHOST tail item {tail_item} has inconsistent AUO metadata lengths.")
+            if any(item_id not in head_items for item_id in candidate_ids):
+                raise ValueError(f"GHOST tail item {tail_item} has a non-head AUO candidate.")
+            actual_lcp = [
+                longest_common_prefix_length(self.item2tokens[tail_item], sid)
+                for sid in candidate_sids
+            ]
+            if actual_lcp != lcp_values:
+                raise ValueError(f"GHOST tail item {tail_item} has stale AUO LCP metadata.")
+            if lcp_values != sorted(lcp_values):
+                raise ValueError(f"GHOST tail item {tail_item} AUO candidates are not LCP-ranked.")
+
     @classmethod
     def load(cls, config: dict):
         tokenizer = cls(config)
@@ -452,6 +666,9 @@ class GhostSKTTokenizer(AbstractTokenizer):
             tokenizer._restore_metadata(metadata)
         if Path(tokenizer.undesired_collection_path).exists():
             tokenizer.undesired_collection = tokenizer._load_json_if_exists(tokenizer.undesired_collection_path) or {}
+        if tokenizer.item2tokens and tokenizer.head_item_ids and tokenizer.tail_item_ids:
+            tokenizer._validate_tokenization()
+            tokenizer._validate_undesired_collection()
         return tokenizer
 
     def get_item_tokens(self, item_id: int) -> list[int]:

@@ -34,3 +34,9 @@ auo_alpha: 0.0
 auo_ka: 200
 auo_kb: 5
 auo_temperature: 1.0
+auo_context: "candidate_specific"
+auo_reduction: "token_mean"
+auo_include_eos: false
+auo_exclude_shared_prefix: true
+auo_require_collection: true
+auo_require_batch_metadata: true

@@ -19,12 +19,54 @@ class GhostAuoMixin:
 
     def _init_ghost_mixin(self, config) -> None:
         self.ghost_variant = str(getattr(config, "ghost_variant", "ghost")).lower()
-        self.auo_alpha = float(getattr(config, "auo_alpha", 0.1))
+        if self.ghost_variant not in {"ghost", "skt_only"}:
+            raise ValueError(f"Unknown GHOST variant: {self.ghost_variant}.")
+        configured_alpha = float(getattr(config, "auo_alpha", 0.1))
+        self.auo_alpha = 0.0 if self.ghost_variant == "skt_only" else configured_alpha
         self.auo_ka = int(getattr(config, "auo_ka", 200))
         self.auo_kb = int(getattr(config, "auo_kb", 5))
         self.auo_temperature = float(getattr(config, "auo_temperature", 1.0))
+        self.auo_context = str(getattr(config, "auo_context", "candidate_specific")).lower()
+        self.auo_reduction = str(getattr(config, "auo_reduction", "token_mean")).lower()
+        self.auo_include_eos = bool(getattr(config, "auo_include_eos", False))
+        self.auo_exclude_shared_prefix = bool(getattr(config, "auo_exclude_shared_prefix", True))
+        self.auo_require_collection = bool(getattr(config, "auo_require_collection", True))
+        self.auo_require_batch_metadata = bool(
+            getattr(config, "auo_require_batch_metadata", True)
+        )
+        if self.auo_alpha < 0.0:
+            raise ValueError("GHOST auo_alpha must be non-negative.")
+        if self.auo_ka <= 0 or self.auo_kb <= 0 or self.auo_kb > self.auo_ka:
+            raise ValueError("GHOST requires 0 < auo_kb <= auo_ka.")
+        if self.auo_temperature <= 0.0:
+            raise ValueError("GHOST auo_temperature must be positive.")
+        if self.auo_context != "candidate_specific":
+            raise ValueError("Only candidate-specific AUO context is implemented exactly.")
+        if self.auo_reduction not in {"token_mean", "candidate_mean"}:
+            raise ValueError("GHOST auo_reduction must be 'token_mean' or 'candidate_mean'.")
         self.ghost_collection_path = getattr(config, "ghost_collection_path", None)
-        self.ghost_collection = self._load_ghost_collection(self.ghost_collection_path)
+        self.ghost_collection = (
+            self._load_ghost_collection(self.ghost_collection_path)
+            if self.ghost_variant == "ghost" and self.auo_alpha > 0.0
+            else {}
+        )
+        if (
+            self.ghost_variant == "ghost"
+            and self.auo_alpha > 0.0
+            and self.auo_require_collection
+            and not self.ghost_collection
+        ):
+            raise FileNotFoundError(
+                "Full GHOST requires a non-empty undesired collection; got "
+                f"ghost_collection_path={self.ghost_collection_path!r}."
+            )
+        self.config.auo_alpha = self.auo_alpha
+        self.config.auo_context = self.auo_context
+        self.config.auo_reduction = self.auo_reduction
+        self.config.auo_include_eos = self.auo_include_eos
+        self.config.auo_exclude_shared_prefix = self.auo_exclude_shared_prefix
+        self.config.auo_require_collection = self.auo_require_collection
+        self.config.auo_require_batch_metadata = self.auo_require_batch_metadata
         self._build_auo_candidate_cache()
 
     def _build_auo_candidate_cache(self) -> None:
@@ -39,12 +81,12 @@ class GhostAuoMixin:
             self.register_buffer(
                 "_auo_candidate_labels",
                 torch.empty((0, 0, 0), dtype=torch.long),
-                persistent=True,
+                persistent=False,
             )
             self.register_buffer(
                 "_auo_candidate_valid",
                 torch.empty((0, 0), dtype=torch.bool),
-                persistent=True,
+                persistent=False,
             )
             return
 
@@ -62,7 +104,8 @@ class GhostAuoMixin:
             candidates: list[list[int]] = []
             for sid in entry.get("head_sids", [])[: self.auo_kb]:
                 sequence = [int(token) for token in sid]
-                sequence.append(eos_token_id)
+                if self.auo_include_eos:
+                    sequence.append(eos_token_id)
                 candidates.append(sequence)
                 max_sequence_length = max(max_sequence_length, len(sequence))
             entries[item_id] = candidates
@@ -72,12 +115,12 @@ class GhostAuoMixin:
             self.register_buffer(
                 "_auo_candidate_labels",
                 torch.empty((0, 0, 0), dtype=torch.long),
-                persistent=True,
+                persistent=False,
             )
             self.register_buffer(
                 "_auo_candidate_valid",
                 torch.empty((0, 0), dtype=torch.bool),
-                persistent=True,
+                persistent=False,
             )
             return
 
@@ -94,8 +137,10 @@ class GhostAuoMixin:
                 )
                 valid[item_id, candidate_index] = True
 
-        self.register_buffer("_auo_candidate_labels", labels, persistent=True)
-        self.register_buffer("_auo_candidate_valid", valid, persistent=True)
+        # This cache is derived from the tokenizer artifact. Keeping it out of
+        # checkpoints avoids coupling model weights to a dataset-sized tensor.
+        self.register_buffer("_auo_candidate_labels", labels, persistent=False)
+        self.register_buffer("_auo_candidate_valid", valid, persistent=False)
 
     @staticmethod
     def _load_ghost_collection(path: Optional[str]) -> dict[str, Any]:
@@ -141,7 +186,7 @@ class GhostAuoMixin:
         if self.config.tie_word_embeddings:
             sequence_output = sequence_output * (self.model_dim**-0.5)
         lm_logits = self.lm_head(sequence_output)
-        return self._scale_logits(lm_logits)
+        return self._scale_logits(lm_logits) / self.auo_temperature
 
     def _candidate_sequences_for_batch(
         self,
@@ -169,7 +214,8 @@ class GhostAuoMixin:
             head_sids = entry.get("head_sids", [])
             for sid in head_sids[: self.auo_kb]:
                 sequence = [int(token) for token in sid]
-                sequence.append(int(self.config.eos_token_id))
+                if self.auo_include_eos:
+                    sequence.append(int(self.config.eos_token_id))
                 batch_indices.append(batch_index)
                 candidate_sequences.append(sequence)
         return batch_indices, candidate_sequences
@@ -190,15 +236,40 @@ class GhostAuoMixin:
         encoder_attention_mask: torch.Tensor,
         item_ids: Optional[torch.Tensor],
         target_is_tail: Optional[torch.Tensor],
+        target_labels: Optional[torch.Tensor],
     ) -> torch.Tensor:
         if self.auo_alpha <= 0.0 or not self.ghost_collection:
             return encoder_memory.new_tensor(0.0)
 
-        if item_ids is None or self._auo_candidate_labels.numel() == 0:
+        require_metadata = (
+            self.training
+            and self.ghost_variant == "ghost"
+            and self.auo_require_batch_metadata
+        )
+        if item_ids is None:
+            if require_metadata:
+                raise ValueError(
+                    "Full GHOST training requires item_id from GhostDataCollator."
+                )
+            return encoder_memory.new_tensor(0.0)
+        if target_is_tail is None and require_metadata:
+            raise ValueError(
+                "Full GHOST training requires target_is_tail from GhostDataCollator."
+            )
+        if target_labels is None and require_metadata:
+            raise ValueError("Full GHOST training requires target labels for AUO masking.")
+        if self._auo_candidate_labels.numel() == 0:
+            if require_metadata:
+                raise ValueError("Full GHOST training has no cached AUO candidates.")
             return encoder_memory.new_tensor(0.0)
 
         item_ids = item_ids.to(device=encoder_memory.device, dtype=torch.long).reshape(-1)
         batch_size = item_ids.size(0)
+        if batch_size != encoder_memory.size(0):
+            raise ValueError(
+                "GHOST item_id batch size does not match encoder batch size: "
+                f"{batch_size} != {encoder_memory.size(0)}."
+            )
         cache_size = self._auo_candidate_labels.size(0)
         in_range = (item_ids >= 0) & (item_ids < cache_size)
         safe_item_ids = item_ids.clamp(min=0, max=cache_size - 1)
@@ -206,6 +277,19 @@ class GhostAuoMixin:
         candidate_valid = self._auo_candidate_valid.index_select(0, safe_item_ids)
         if target_is_tail is not None:
             tail_mask = target_is_tail.to(device=encoder_memory.device).reshape(-1).bool()
+            if tail_mask.size(0) != batch_size:
+                raise ValueError(
+                    "GHOST target_is_tail batch size does not match item_id batch size."
+                )
+            missing_candidates = tail_mask & (
+                ~in_range | ~candidate_valid.any(dim=1)
+            )
+            if require_metadata and missing_candidates.any():
+                missing_ids = item_ids[missing_candidates].detach().cpu().tolist()
+                raise ValueError(
+                    "Full GHOST training is missing AUO candidates for tail item IDs: "
+                    f"{missing_ids[:8]}."
+                )
             candidate_valid = candidate_valid & tail_mask.unsqueeze(1)
         candidate_valid = candidate_valid & in_range.unsqueeze(1)
         valid_rows = candidate_valid.reshape(-1)
@@ -214,6 +298,14 @@ class GhostAuoMixin:
 
         candidate_labels = candidate_labels.reshape(batch_size * self.auo_kb, -1)
         candidate_labels = candidate_labels[valid_rows]
+        expanded_target_labels = None
+        if target_labels is not None:
+            expanded_target_labels = (
+                target_labels.to(device=encoder_memory.device, dtype=torch.long)
+                .unsqueeze(1)
+                .expand(-1, self.auo_kb, -1)
+                .reshape(batch_size * self.auo_kb, -1)
+            )[valid_rows]
         expanded_memory = (
             encoder_memory.unsqueeze(1)
             .expand(-1, self.auo_kb, -1, -1)
@@ -229,13 +321,30 @@ class GhostAuoMixin:
             encoder_attention_mask=expanded_mask,
             labels=candidate_labels,
         )
-        probs = F.softmax(logits, dim=-1)
-        target_probs = probs.gather(dim=-1, index=candidate_labels.clamp_min(0).unsqueeze(-1)).squeeze(-1)
-        unlikelihood = -torch.log1p(-target_probs.clamp(max=1.0 - 1e-7))
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        candidate_log_probs = log_probs.gather(
+            dim=-1,
+            index=candidate_labels.clamp_min(0).unsqueeze(-1),
+        ).squeeze(-1)
+        one_minus_probability = -torch.expm1(candidate_log_probs)
+        unlikelihood = -torch.log(one_minus_probability.clamp_min(1e-7))
         mask = candidate_labels.ne(-100)
+        if self.auo_exclude_shared_prefix and expanded_target_labels is not None:
+            compare_length = min(candidate_labels.size(1), expanded_target_labels.size(1))
+            same_prefix_token = (
+                candidate_labels[:, :compare_length].eq(expanded_target_labels[:, :compare_length])
+                & expanded_target_labels[:, :compare_length].ne(-100)
+            )
+            shared_prefix_positions = same_prefix_token.to(torch.long).cumprod(dim=1).bool()
+            mask[:, :compare_length] &= ~shared_prefix_positions
         if not mask.any():
             return encoder_memory.new_tensor(0.0)
-        return (unlikelihood * mask).sum() / mask.sum().clamp_min(1)
+        masked_unlikelihood = unlikelihood * mask
+        if self.auo_reduction == "candidate_mean":
+            valid_candidates = mask.any(dim=1)
+            candidate_losses = masked_unlikelihood.sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            return candidate_losses[valid_candidates].mean()
+        return masked_unlikelihood.sum() / mask.sum().clamp_min(1)
 
     def _augment_with_auo(
         self,
@@ -260,6 +369,7 @@ class GhostAuoMixin:
             encoder_attention_mask=attention_mask,
             item_ids=item_id,
             target_is_tail=target_is_tail,
+            target_labels=labels,
         )
         total_loss = base_loss + self.auo_alpha * auo_loss if base_loss is not None else self.auo_alpha * auo_loss
         outputs.loss = total_loss

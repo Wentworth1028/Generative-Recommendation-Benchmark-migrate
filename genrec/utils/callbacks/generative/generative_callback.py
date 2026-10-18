@@ -43,9 +43,10 @@ class GenerativeLoggingCallback(TrainerCallback):
                 self.logger.info(log_str)
 
 class DelayedEvaluateEveryNEpochsCallback(TrainerCallback):
-    def __init__(self, n_epochs=5, start_epoch=0):
+    def __init__(self, n_epochs=5, start_epoch=0, save_on_evaluation_only=False):
         self.n_epochs = n_epochs
         self.start_epoch = start_epoch
+        self.save_on_evaluation_only = save_on_evaluation_only
         self.last_eval_epoch = -1
     
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -53,13 +54,19 @@ class DelayedEvaluateEveryNEpochsCallback(TrainerCallback):
         
         if current_epoch < self.start_epoch:
             control.should_evaluate = False
+            if self.save_on_evaluation_only:
+                control.should_save = False
         
         elif current_epoch % self.n_epochs == 0:
             control.should_evaluate = True
+            if self.save_on_evaluation_only:
+                control.should_save = True
             self.last_eval_epoch = current_epoch
         else:
             control.should_evaluate = False
+            if self.save_on_evaluation_only:
+                control.should_save = False
             
     def on_evaluate(self, args, state, control, metrics, **kwargs):
         if int(round(state.epoch)) == self.last_eval_epoch:
-             control.should_save = True
+            control.should_save = True

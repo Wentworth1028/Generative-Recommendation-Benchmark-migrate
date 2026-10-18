@@ -407,6 +407,20 @@ def stage2_train_generation_model(
                 "num_beams": model_config.get("num_beams"),
                 "max_gen_length": model_config.get("max_gen_length"),
                 "k_list": model_config.get("k_list"),
+                "evaluation_epoch": model_config.get("evaluation_epoch"),
+                "evaluation_start_epoch": model_config.get("evaluation_start_epoch"),
+                "early_stop_upper_steps": model_config.get("early_stop_upper_steps"),
+                "dataloader_num_workers": model_config.get("dataloader_num_workers", 0),
+                "dataloader_pin_memory": model_config.get("dataloader_pin_memory", True),
+                "dataloader_persistent_workers": model_config.get(
+                    "dataloader_persistent_workers", False
+                ),
+                "dataloader_prefetch_factor": model_config.get(
+                    "dataloader_prefetch_factor"
+                ),
+                "save_on_evaluation_only": model_config.get(
+                    "save_on_evaluation_only", False
+                ),
                 "seed": model_config.get("seed"),
                 "d_model": model_config.get("d_model"),
                 "d_kv": model_config.get("d_kv"),

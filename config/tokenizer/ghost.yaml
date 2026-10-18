@@ -16,3 +16,7 @@ auo_ka: 200
 auo_kb: 5
 kmeans_n_init: "auto"
 kmeans_max_iter: 100
+collision_repair_enabled: true
+collision_candidates_per_layer: 8
+collision_beam_width: 256
+allow_legacy_artifacts: false
