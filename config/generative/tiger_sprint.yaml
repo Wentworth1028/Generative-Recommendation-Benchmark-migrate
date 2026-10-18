@@ -1,0 +1,16 @@
+# SPRINT keeps the TIGER tokenizer, T5 backbone, NLL, and constrained decoding.
+# Defaults below reproduce the supplied GenRec SASRec-SPRINT implementation.
+type: "tiger_sprint"
+trainer:
+  _target_: genrec.trainers.generative.sprint_trainer.SPRINTTigerTrainer
+  _partial_: true
+  sprint_attention_weight: 1.0
+  sprint_ffn_weight: 0.001
+  sprint_embedding_weight: 0.1
+  sprint_attention_temperature: 4.0
+  sprint_spectral_norm_iters: 1
+  sprint_eps: 1e-12
+  sprint_log_transform: "log1p"
+  sprint_layer_reduction: "mean"
+  sprint_attention_scopes: ["encoder_self", "decoder_self", "decoder_cross"]
+  sprint_ffn_scopes: ["encoder", "decoder"]
