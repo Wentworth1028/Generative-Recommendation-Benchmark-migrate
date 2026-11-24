@@ -36,6 +36,8 @@ auo_kb: 5
 auo_temperature: 1.0
 auo_context: "candidate_specific"
 auo_reduction: "token_mean"
+ghost_nll_reduction: "token_mean"
+head_eos_weight: 1.0
 auo_include_eos: false
 auo_exclude_shared_prefix: true
 auo_require_collection: true

@@ -22,7 +22,11 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from disrec.sasrec.sasrec4hf import SASRecConfig,SASRec4HF
 from disrec.datasets.model_dataset import SASRecDataset
 from disrec.datasets.data_collator import SASRecDataCollator
-from genrec.utils.popularity_metrics import compute_prediction_popularity_metrics, compute_train_item_popularity
+from genrec.utils.popularity_metrics import (
+    build_fairness_context,
+    compute_prediction_popularity_metrics,
+    compute_train_item_popularity,
+)
 
 from transformers import TrainerCallback,EarlyStoppingCallback
 import numpy as np
@@ -217,7 +221,7 @@ if __name__ == "__main__":
         args=training_args,
         callbacks = callbacks,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
@@ -225,6 +229,12 @@ if __name__ == "__main__":
     
 
     trainer.train()
+
+    print("--- Best Checkpoint Validation ---")
+    validation_results = trainer.evaluate(
+        eval_dataset=eval_dataset,
+        metric_key_prefix="validation_best",
+    )
 
     print("--- Test Set Evaluation ---")
     test_predictions = trainer.predict(test_dataset)
@@ -259,8 +269,11 @@ if __name__ == "__main__":
         "best_checkpoint": trainer.state.best_model_checkpoint,
         "best_model_dir": os.path.abspath(best_model_dir),
         "best_metric": trainer.state.best_metric,
+        "selection_split": "valid",
+        "validation_metrics": validation_results,
         "metrics": test_results_renamed,
         "popularity_metrics": popularity_metrics,
+        "fairness_context": build_fairness_context(train_item_popularity),
         "config": {
             "max_seq_len": args.max_seq_len,
             "embedding_dim": args.embedding_dim,
@@ -278,10 +291,13 @@ if __name__ == "__main__":
             "eval_every_n_epochs": args.eval_every_n_epochs,
             "save_total_limit": args.save_total_limit,
             "seed": args.seed,
+            "selection_split": "valid",
         },
     }
     final_metrics_path = os.path.join(OUTPUT_DIR, "final_metrics.json")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(os.path.join(OUTPUT_DIR, "predictions.json"), "w", encoding="utf-8") as f:
+        json.dump(sasrec_predictions, f)
     with open(final_metrics_path, "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, ensure_ascii=False, indent=2)
     print(f"save final metrics to: {final_metrics_path}")

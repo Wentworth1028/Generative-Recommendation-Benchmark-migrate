@@ -14,19 +14,20 @@ from genrec.utils.common_utils import infer_tokenizer_kind, set_seed, tokenizer_
 from genrec.utils.logging_utils import setup_logging
 from genrec.utils.factory import get_model_factory, get_dataset_class, get_collator_class, get_pipeline_class, get_tokenizer_class
 from genrec.utils.trainer_setup.generative_setup import setup_training
+from genrec.utils.models_setup.crab_setup import merge_attention_lora, prepare_crab_model
 from genrec.utils.popularity_metrics import (
-    compute_dataset_item_popularity,
+    build_fairness_context,
     compute_prediction_popularity_metrics,
     compute_train_item_popularity,
     compute_token_popularity_metrics,
 )
 from genrec.utils.bqs import (
     DEFAULT_BQS_PENALTIES,
-    DEFAULT_BQS_TEMPERATURE,
     build_popularity_classes,
     compute_bqs_metrics,
     compute_low_popularity_quality_metrics,
     load_final_metrics,
+    resolve_bqs_temperature,
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -112,6 +113,9 @@ def stage2_train_generation_model(
     model_config, rqvae_config, generative_config: DictConfig, output_dirs, accelerator, logger, force_retrain=False
 ):
 
+    bqs_temperature = resolve_bqs_temperature(model_config.get("bqs_temperature"))
+    model_config["bqs_temperature"] = bqs_temperature
+
     if accelerator.is_main_process:
         logger.info("\n" + "=" * 60)
         logger.info("training generation model")
@@ -165,10 +169,45 @@ def stage2_train_generation_model(
         model_config["ghost_variant"] = "skt_only" if "skt_only" in gen_type else "ghost"
 
     model = create_model_fn(vocab_size=vocab_size, model_config=model_config)
+    crab_setup_report = None
     if do_inference_only:
         if accelerator.is_main_process:
             logger.info(f"loading hf model from dir: {output_dirs['model']}")
         model = model.__class__.from_pretrained(output_dirs["model"])
+    elif gen_type in {"tiger_crab", "letter_crab"}:
+        pretrained_model_path = model_config.get("crab_pretrained_model_path")
+        if not pretrained_model_path:
+            raise ValueError(
+                f"{gen_type} requires model.crab_pretrained_model_path. "
+                "CRAB adapts a trained backbone rather than training a fresh model."
+            )
+        token_initialization_path = model_config.get("crab_token_initialization_path") or os.path.join(
+            output_dirs["tokenizer"], "crab_token_initialization.json"
+        )
+        model, crab_setup_report = prepare_crab_model(
+            model=model,
+            pretrained_model_path=pretrained_model_path,
+            token_initialization_path=token_initialization_path,
+            vocab_size=vocab_size,
+            lora_rank=int(model_config.get("crab_lora_rank", 8)),
+            lora_alpha=float(model_config.get("crab_lora_alpha", 16.0)),
+            lora_dropout=float(model_config.get("crab_lora_dropout", 0.0)),
+        )
+        if accelerator.is_main_process:
+            setup_path = os.path.join(output_dirs["model"], "crab_model_setup.json")
+            with open(setup_path, "w", encoding="utf-8") as f:
+                json.dump(crab_setup_report, f, ensure_ascii=False, indent=2)
+            logger.info(
+                "CRAB initialized from %s: vocab %d -> %d, copied %d new tokens, "
+                "%d attention LoRA modules, %d/%d trainable parameters.",
+                pretrained_model_path,
+                crab_setup_report["old_vocab_size"],
+                crab_setup_report["new_vocab_size"],
+                crab_setup_report["initialized_new_tokens"],
+                crab_setup_report["lora_module_count"],
+                crab_setup_report["trainable_parameters"],
+                crab_setup_report["total_parameters"],
+            )
     # if use_user_tokens:
     #     model = create_tiger_model(
     #     vocab_size=tokenizer.vocab_size,
@@ -267,6 +306,14 @@ def stage2_train_generation_model(
     else:
         trainer.train()
         accelerator.wait_for_everyone()
+        if gen_type in {"tiger_crab", "letter_crab"}:
+            merged_lora_modules = merge_attention_lora(trainer.model)
+            if accelerator.is_main_process:
+                logger.info(
+                    "Merged and removed %d CRAB LoRA modules before evaluation.",
+                    merged_lora_modules,
+                )
+            accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         logger.info("predict test set...")
@@ -289,7 +336,9 @@ def stage2_train_generation_model(
                 item_ids.append(int(item_id))
             tiger_predictions.append(item_ids)
 
-        item_popularity = compute_dataset_item_popularity(model_config['data_interaction_files'], shift_item_id=0)
+        item_popularity = compute_train_item_popularity(
+            model_config['data_interaction_files'], item_ids=tokenizer.item2tokens
+        )
         popularity_metrics = compute_prediction_popularity_metrics(
             tiger_predictions,
             item_popularity,
@@ -307,13 +356,7 @@ def stage2_train_generation_model(
         bqs_details = {}
         bqs_context = {}
         if model_config.get("bqs_enabled", True):
-            train_item_popularity = compute_train_item_popularity(
-                model_config['data_interaction_files'], shift_item_id=0
-            )
-            # Keep items that only occur in validation/test in the catalog with
-            # zero training popularity. This does not leak their held-out count.
-            for item_id in item_popularity:
-                train_item_popularity.setdefault(item_id, 0)
+            train_item_popularity = item_popularity
 
             popularity_classes = build_popularity_classes(train_item_popularity)
             test_labels = [int(label) for label in test_results.label_ids.reshape(-1).tolist()]
@@ -331,9 +374,6 @@ def stage2_train_generation_model(
                 "hit": float(model_config.get("bqs_hit_penalty", DEFAULT_BQS_PENALTIES["hit"])),
                 "ndcg": float(model_config.get("bqs_ndcg_penalty", DEFAULT_BQS_PENALTIES["ndcg"])),
             }
-            bqs_temperature = float(
-                model_config.get("bqs_temperature", DEFAULT_BQS_TEMPERATURE)
-            )
             bqs_context["penalties"] = penalties
             bqs_context["temperature"] = bqs_temperature
             baseline_metrics_path = model_config.get("bqs_baseline_metrics_path")
@@ -391,6 +431,7 @@ def stage2_train_generation_model(
             "inference_mode": model_config.get("inference_mode"),
             "metrics": {key: float(value) for key, value in metrics.items()},
             "popularity_metrics": {key: float(value) for key, value in popularity_metrics.items()},
+            "fairness_context": build_fairness_context(item_popularity),
             "token_popularity_metrics": {key: float(value) for key, value in token_popularity_metrics.items()},
             "low_popularity_quality_metrics": {
                 key: float(value) for key, value in low_quality_metrics.items()
@@ -421,6 +462,10 @@ def stage2_train_generation_model(
                 "save_on_evaluation_only": model_config.get(
                     "save_on_evaluation_only", False
                 ),
+                "ghost_nll_reduction": model_config.get("ghost_nll_reduction"),
+                "head_eos_weight": model_config.get("head_eos_weight"),
+                "auo_alpha": model_config.get("auo_alpha"),
+                "auo_kb": model_config.get("auo_kb"),
                 "seed": model_config.get("seed"),
                 "d_model": model_config.get("d_model"),
                 "d_kv": model_config.get("d_kv"),
@@ -438,12 +483,25 @@ def stage2_train_generation_model(
                 "bqs_ndcg_penalty": model_config.get(
                     "bqs_ndcg_penalty", DEFAULT_BQS_PENALTIES["ndcg"]
                 ),
-                "bqs_temperature": model_config.get(
-                    "bqs_temperature", DEFAULT_BQS_TEMPERATURE
+                "bqs_temperature": bqs_temperature,
+                "crab_pretrained_model_path": model_config.get(
+                    "crab_pretrained_model_path"
+                ),
+                "crab_lora_rank": model_config.get("crab_lora_rank"),
+                "crab_lora_alpha": model_config.get("crab_lora_alpha"),
+                "crab_lora_dropout": model_config.get("crab_lora_dropout"),
+                "crab_gamma": (
+                    generative_config.trainer.get("gamma")
+                    if gen_type in {"tiger_crab", "letter_crab"}
+                    else None
                 ),
             },
         }
+        if crab_setup_report is not None:
+            final_metrics["crab_setup"] = crab_setup_report
         final_metrics_path = os.path.join(output_dirs['base'], "final_metrics.json")
+        with open(os.path.join(output_dirs['base'], "predictions.json"), "w", encoding="utf-8") as f:
+            json.dump(tiger_predictions, f)
         with open(final_metrics_path, "w", encoding="utf-8") as f:
             json.dump(final_metrics, f, ensure_ascii=False, indent=2)
         logger.info(f"Final metrics saved to: {final_metrics_path}")

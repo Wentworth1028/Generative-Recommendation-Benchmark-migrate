@@ -55,6 +55,12 @@ crab:
   analysis_top_ratio: 0.05
   max_splits: 3
   balance_weight: 1.0
+  # The paper defines token popularity from raw training frequencies. The
+  # normalized mode remains available as an explicit engineering adaptation.
+  popularity_scale: "raw"
+  # RQ-VAE SIDs are not guaranteed to be unique. Preserve them by default and
+  # report ambiguity instead of silently inventing one token per item.
+  collision_policy: "preserve"
   kmeans_max_iter: 50
   reg_weight: 1e-3
   random_seed: 2026

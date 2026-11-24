@@ -28,6 +28,10 @@ class GhostAuoMixin:
         self.auo_temperature = float(getattr(config, "auo_temperature", 1.0))
         self.auo_context = str(getattr(config, "auo_context", "candidate_specific")).lower()
         self.auo_reduction = str(getattr(config, "auo_reduction", "token_mean")).lower()
+        self.ghost_nll_reduction = str(
+            getattr(config, "ghost_nll_reduction", "token_mean")
+        ).lower()
+        self.head_eos_weight = float(getattr(config, "head_eos_weight", 1.0))
         self.auo_include_eos = bool(getattr(config, "auo_include_eos", False))
         self.auo_exclude_shared_prefix = bool(getattr(config, "auo_exclude_shared_prefix", True))
         self.auo_require_collection = bool(getattr(config, "auo_require_collection", True))
@@ -44,6 +48,12 @@ class GhostAuoMixin:
             raise ValueError("Only candidate-specific AUO context is implemented exactly.")
         if self.auo_reduction not in {"token_mean", "candidate_mean"}:
             raise ValueError("GHOST auo_reduction must be 'token_mean' or 'candidate_mean'.")
+        if self.ghost_nll_reduction not in {"token_mean", "sample_mean"}:
+            raise ValueError(
+                "GHOST ghost_nll_reduction must be 'token_mean' or 'sample_mean'."
+            )
+        if self.head_eos_weight <= 0.0:
+            raise ValueError("GHOST head_eos_weight must be positive.")
         self.ghost_collection_path = getattr(config, "ghost_collection_path", None)
         self.ghost_collection = (
             self._load_ghost_collection(self.ghost_collection_path)
@@ -63,11 +73,64 @@ class GhostAuoMixin:
         self.config.auo_alpha = self.auo_alpha
         self.config.auo_context = self.auo_context
         self.config.auo_reduction = self.auo_reduction
+        self.config.ghost_nll_reduction = self.ghost_nll_reduction
+        self.config.head_eos_weight = self.head_eos_weight
         self.config.auo_include_eos = self.auo_include_eos
         self.config.auo_exclude_shared_prefix = self.auo_exclude_shared_prefix
         self.config.auo_require_collection = self.auo_require_collection
         self.config.auo_require_batch_metadata = self.auo_require_batch_metadata
         self._build_auo_candidate_cache()
+
+    def _compute_ghost_nll(
+        self,
+        logits: torch.Tensor,
+        labels: torch.LongTensor,
+        target_is_tail: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Reduce token NLL per sample and optionally emphasize head EOS.
+
+        ``sample_mean`` first averages over each item's valid target tokens, so
+        a six-token tail SID no longer receives more aggregate NLL weight than
+        a four-token head SID. ``head_eos_weight`` only scales the head item's
+        EOS decision, where a shared skeleton branches between stopping at the
+        head item and continuing into a tail suffix.
+        """
+        labels = labels.to(device=logits.device, dtype=torch.long)
+        target_is_tail = target_is_tail.to(device=logits.device).reshape(-1).bool()
+        if labels.dim() != 2 or logits.shape[:2] != labels.shape:
+            raise ValueError(
+                "GHOST logits/labels must have shapes [batch, length, vocab] "
+                "and [batch, length]."
+            )
+        if target_is_tail.numel() != labels.size(0):
+            raise ValueError(
+                "GHOST target_is_tail batch size does not match target labels."
+            )
+
+        valid = labels.ne(-100)
+        token_nll = F.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape_as(labels)
+
+        weights = valid.to(token_nll.dtype)
+        if self.head_eos_weight != 1.0:
+            head_eos = (
+                ~target_is_tail.unsqueeze(1)
+                & labels.eq(int(self.config.eos_token_id))
+                & valid
+            )
+            weights = weights + head_eos.to(weights.dtype) * (
+                self.head_eos_weight - 1.0
+            )
+
+        weighted_nll = token_nll * weights
+        valid_counts = valid.sum(dim=1).clamp_min(1).to(token_nll.dtype)
+        if self.ghost_nll_reduction == "sample_mean":
+            return (weighted_nll.sum(dim=1) / valid_counts).mean()
+        return weighted_nll.sum() / valid_counts.sum()
 
     def _build_auo_candidate_cache(self) -> None:
         """Build a dense, device-movable cache for static AUO candidates.
@@ -364,6 +427,20 @@ class GhostAuoMixin:
             raise ValueError("Ghost models require attention_mask when labels are provided.")
 
         base_loss = outputs.loss
+        if (
+            self.ghost_nll_reduction != "token_mean"
+            or self.head_eos_weight != 1.0
+        ):
+            if target_is_tail is None:
+                raise ValueError(
+                    "GHOST custom NLL requires target_is_tail from "
+                    "GhostDataCollator."
+                )
+            base_loss = self._compute_ghost_nll(
+                outputs.logits,
+                labels,
+                target_is_tail,
+            )
         auo_loss = self._compute_auo_loss(
             encoder_memory=outputs.encoder_last_hidden_state,
             encoder_attention_mask=attention_mask,

@@ -40,3 +40,11 @@ bqs_temperature: 0.1
 care_sid_length: 4
 care_query_numbers: [1, 1, 4, 4]
 care_alpha: 0.7
+
+# CRAB post-hoc adaptation. A CRAB run must set the pretrained path to the
+# matching dataset/backbone checkpoint and consume the tokenizer manifest.
+crab_pretrained_model_path: null
+crab_token_initialization_path: null
+crab_lora_rank: 8
+crab_lora_alpha: 16.0
+crab_lora_dropout: 0.0

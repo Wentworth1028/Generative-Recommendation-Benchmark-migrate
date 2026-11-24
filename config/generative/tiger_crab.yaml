@@ -3,4 +3,7 @@ trainer:
   _target_: genrec.trainers.generative.crab_trainer.CrabTigerTrainer
   _partial_: true
   sid_length: 4
-  gamma: 0.2
+  # Paper gamma=0.2 targets MOR/Qwen. TIGER's summed HSA is about 1e4-1e5,
+  # so use a scale-calibrated starting point and tune on validation metrics.
+  gamma: 1.0e-5
+  dominance_warning_ratio: 10.0

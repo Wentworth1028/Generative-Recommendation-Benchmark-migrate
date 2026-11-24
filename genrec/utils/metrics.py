@@ -13,7 +13,12 @@ def calc_ndcg(rank, k):
     return 0
 
 
-def compute_metrics(p: EvalPrediction, tokens_to_item_map: dict, k_list: List[int] = [1, 5, 10]) -> Dict[str, float]:
+def compute_metrics(
+    p: EvalPrediction,
+    tokens_to_item_map: dict,
+    k_list: List[int] = [1, 5, 10],
+    item_popularity: Dict[int, int] | None = None,
+) -> Dict[str, float]:
     batch_size = p.predictions.shape[0]
     num_beams = p.predictions.shape[1]
 
@@ -53,5 +58,12 @@ def compute_metrics(p: EvalPrediction, tokens_to_item_map: dict, k_list: List[in
     final_metrics = {}
     for key, value in metrics.items():
         final_metrics[key] = value / total_samples
+
+    if item_popularity is not None:
+        from genrec.utils.popularity_metrics import compute_prediction_popularity_metrics
+
+        final_metrics.update(
+            compute_prediction_popularity_metrics(all_predictions, item_popularity, k_list=k_list)
+        )
 
     return final_metrics

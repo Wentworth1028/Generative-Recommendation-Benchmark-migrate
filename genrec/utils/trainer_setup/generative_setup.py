@@ -79,7 +79,19 @@ def setup_training(
     )
 
     tokens_to_item_map = tokenizer.tokens2item
-    compute_metrics_with_map = partial(compute_metrics, tokens_to_item_map=tokens_to_item_map)
+    item_popularity = None
+    if model_config.get("report_validation_popularity", False):
+        from genrec.utils.popularity_metrics import compute_train_item_popularity
+
+        item_popularity = compute_train_item_popularity(
+            model_config["data_interaction_files"], item_ids=tokenizer.item2tokens
+        )
+    compute_metrics_with_map = partial(
+        compute_metrics,
+        tokens_to_item_map=tokens_to_item_map,
+        k_list=model_config.get("k_list", [1, 5, 10]),
+        item_popularity=item_popularity,
+    )
 
     num_beams = model_config.get('num_beams', 10)
     max_gen_length = model_config.get('max_gen_length', 5)

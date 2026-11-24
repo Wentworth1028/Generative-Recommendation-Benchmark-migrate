@@ -22,6 +22,16 @@ DEFAULT_BQS_PENALTIES = {"hit": 10.0, "ndcg": 2.0}
 DEFAULT_BQS_TEMPERATURE = 0.1
 
 
+def resolve_bqs_temperature(value: object) -> float:
+    """Normalize optional configuration values and validate the BQS temperature."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return DEFAULT_BQS_TEMPERATURE
+    temperature = float(value)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"BQS temperature must be positive and finite, got {temperature}.")
+    return temperature
+
+
 @dataclass(frozen=True)
 class PopularityClasses:
     low: frozenset[int]

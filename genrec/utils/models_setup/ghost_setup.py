@@ -32,6 +32,10 @@ def _build_ghost_config(vocab_size: int, model_config: dict, *, include_tau: boo
     config.auo_temperature = float(model_config.get("auo_temperature", 1.0))
     config.auo_context = str(model_config.get("auo_context", "candidate_specific"))
     config.auo_reduction = str(model_config.get("auo_reduction", "token_mean"))
+    config.ghost_nll_reduction = str(
+        model_config.get("ghost_nll_reduction", "token_mean")
+    )
+    config.head_eos_weight = float(model_config.get("head_eos_weight", 1.0))
     config.auo_include_eos = bool(model_config.get("auo_include_eos", False))
     config.auo_exclude_shared_prefix = bool(model_config.get("auo_exclude_shared_prefix", True))
     config.auo_require_collection = bool(model_config.get("auo_require_collection", True))

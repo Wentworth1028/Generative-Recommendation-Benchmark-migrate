@@ -18,7 +18,8 @@ from genrec.utils.logging_utils import setup_logging
 from genrec.utils.metrics import compute_metrics
 from genrec.utils.models_setup.genplugin_setup import create_genplugin_letter_model, create_genplugin_tiger_model
 from genrec.utils.popularity_metrics import (
-    compute_dataset_item_popularity,
+    build_fairness_context,
+    compute_train_item_popularity,
     compute_prediction_popularity_metrics,
     compute_token_popularity_metrics,
 )
@@ -173,7 +174,9 @@ def main() -> None:
             item_ids.append(int(item_id))
         predictions.append(item_ids)
 
-    item_popularity = compute_dataset_item_popularity(args.data_interaction_files, shift_item_id=0)
+    item_popularity = compute_train_item_popularity(
+        args.data_interaction_files, item_ids=tokenizer.item2tokens
+    )
     popularity_metrics = compute_prediction_popularity_metrics(
         predictions,
         item_popularity,
@@ -193,6 +196,7 @@ def main() -> None:
             "output_dir": str(output_dir.resolve()),
             "metrics": {key: float(value) for key, value in metrics.items()},
             "popularity_metrics": {key: float(value) for key, value in popularity_metrics.items()},
+            "fairness_context": build_fairness_context(item_popularity),
             "token_popularity_metrics": {key: float(value) for key, value in token_popularity_metrics.items()},
             "config": {
                 "num_beams": args.num_beams,

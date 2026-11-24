@@ -103,6 +103,13 @@ class BaseGenerativeTrainer(Trainer):
                     "attention_mask": inputs["attention_mask"],
                     "labels": labels,
                 }
+                # GHOST's optional sample-wise NLL needs the target partition
+                # metadata during validation as well as training.
+                metadata_model = getattr(model, "module", model)
+                if hasattr(metadata_model, "_compute_ghost_nll"):
+                    for metadata_key in ("item_id", "target_is_tail"):
+                        if metadata_key in inputs:
+                            loss_inputs[metadata_key] = inputs[metadata_key]
                 outputs = model(**loss_inputs)
                 loss = outputs.loss.mean().detach() if outputs.loss is not None else torch.tensor(0.0)
             else:

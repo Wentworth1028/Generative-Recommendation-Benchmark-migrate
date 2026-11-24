@@ -1,15 +1,33 @@
+import hashlib
+import json
 import pickle
 from collections import Counter
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Dict, Iterable, List, Sequence
 
 
-def compute_train_item_popularity(data_interaction_files: str, shift_item_id: int = 0) -> Dict[int, int]:
+FAIRNESS_METRIC_VERSION = "fair_0.8_train_catalog_v1"
+FAIRNESS_ALPHA = 0.8
+
+
+def compute_train_item_popularity(
+    data_interaction_files: str,
+    shift_item_id: int = 0,
+    item_ids: Iterable[int] = (),
+) -> Dict[int, int]:
+    """Count training interactions and retain held-out-only items with zero count.
+
+    ``item_ids`` may extend the catalog using IDs after applying any shift.
+    Held-out interactions establish membership only, never popularity.
+    """
     with open(data_interaction_files, "rb") as f:
         user2item_data = pickle.load(f)
 
-    counter = Counter()
+    counter = Counter({int(item_id): 0 for item_id in item_ids})
     for _, row in user2item_data.iterrows():
         item_seq = row["ItemID"]
+        for item_id in item_seq:
+            counter.setdefault(int(item_id) + shift_item_id, 0)
         train_seq = item_seq[:-2]
         counter.update(int(item_id) + shift_item_id for item_id in train_seq)
     return dict(counter)
@@ -27,12 +45,49 @@ def compute_dataset_item_popularity(data_interaction_files: str, shift_item_id: 
 
 
 def get_top_popular_items(item_popularity: Dict[int, int], quantile: float) -> set:
+    """Return the hottest ceil(q*N) items; ties favor the smaller item ID."""
+    if not 0 <= quantile <= 1:
+        raise ValueError("quantile must be between zero and one")
     if not item_popularity:
         return set()
 
     sorted_items = sorted(item_popularity.items(), key=lambda x: (-x[1], x[0]))
-    top_k = max(1, int(len(sorted_items) * quantile))
+    top_k = int((Decimal(str(quantile)) * len(sorted_items)).to_integral_value(rounding=ROUND_CEILING))
     return {item_id for item_id, _ in sorted_items[:top_k]}
+
+
+def get_long_tail_items(item_popularity: Dict[int, int], alpha: float = FAIRNESS_ALPHA) -> set:
+    """Bottom floor(alpha*N) items under the reverse popularity ranking.
+
+    One total order makes head/tail complementary even with tied counts.
+    For alpha=0.8 the head is G1 of a five-way ``np.array_split`` ranking.
+    """
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between zero and one")
+    ranked = sorted(item_popularity, key=lambda item: (-item_popularity[item], item))
+    tail_size = int((Decimal(str(alpha)) * len(ranked)).to_integral_value(rounding=ROUND_FLOOR))
+    return set(ranked[len(ranked) - tail_size:])
+
+
+def build_fairness_context(item_popularity: Dict[int, int]) -> dict:
+    """Save the definition and exact partition alongside newly evaluated metrics."""
+    tail = get_long_tail_items(item_popularity)
+    counts = sorted((int(item), int(count)) for item, count in item_popularity.items())
+    return {
+        "metric_version": FAIRNESS_METRIC_VERSION,
+        "metric": "Fair-0.8@K",
+        "alpha": FAIRNESS_ALPHA,
+        "popularity_source": "train_interactions_leave_last_two_out",
+        "catalog_policy": "all_observed_items_plus_explicit_catalog_zero_filled",
+        "catalog_item_count": len(item_popularity),
+        "tail_item_count": len(tail),
+        "tail_size_rule": "floor(0.8 * catalog_item_count)",
+        "ranking": "descending training count, then ascending item ID; tail is suffix",
+        "denominator": "num_users * K; missing recommendations contribute zero exposure",
+        "train_counts_sha256": hashlib.sha256(json.dumps(counts).encode()).hexdigest(),
+        "tail_item_ids_sha256": hashlib.sha256(json.dumps(sorted(tail)).encode()).hexdigest(),
+        "unpop_alias": "fair_0.8@K",
+    }
 
 
 def get_pop_items_by_interaction_share(item_popularity: Dict[int, int], target_share: float = 0.5) -> set:
@@ -86,8 +141,17 @@ def compute_prediction_popularity_metrics(
     k_list: Iterable[int] = (1, 5, 10),
     quantiles: Iterable[float] = (0.1, 0.2),
 ) -> Dict[str, float]:
+    """Measure exposure with a complete, training-only item popularity catalog.
+
+    Fair-0.8 (also exported as Unpop) counts tail exposure over |U|*K.
+    The old interaction-mass definition has explicit ``interaction50`` names.
+    Missing slots contribute no exposure; unknown item IDs are rejected.
+    ARP continues to average over valid recommendations.
+    """
     metrics = {}
-    pop_items = get_pop_items_by_interaction_share(item_popularity, target_share=0.5)
+    tail_items = get_long_tail_items(item_popularity)
+    pop_items = set(item_popularity) - tail_items
+    interaction50_items = get_pop_items_by_interaction_share(item_popularity, target_share=0.5)
     quantile_pop_items = {
         quantile: get_top_popular_items(item_popularity, quantile)
         for quantile in quantiles
@@ -96,33 +160,51 @@ def compute_prediction_popularity_metrics(
     all_items = set(item_popularity)
 
     for k in k_list:
+        if k <= 0:
+            raise ValueError("K must be positive")
         total_predictions = 0
         pop_predictions = 0
+        tail_predictions = 0
+        interaction50_predictions = 0
         arp_sum = 0.0
         exposure_counter = Counter()
         quantile_hits = {quantile: 0 for quantile in quantile_pop_items}
 
         for predicted_items in predictions:
             top_k_items = [item for item in predicted_items[:k] if item is not None]
+            if unknown := set(top_k_items).difference(item_popularity):
+                raise ValueError(f"Recommendations contain items outside the evaluation catalog: {sorted(unknown)[:5]}")
             total_predictions += len(top_k_items)
             pop_predictions += sum(1 for item in top_k_items if item in pop_items)
+            tail_predictions += sum(1 for item in top_k_items if item in tail_items)
+            interaction50_predictions += sum(1 for item in top_k_items if item in interaction50_items)
             arp_sum += sum(item_popularity.get(item, 0) for item in top_k_items)
             exposure_counter.update(top_k_items)
             all_items.update(top_k_items)
             for quantile, items in quantile_pop_items.items():
                 quantile_hits[quantile] += sum(1 for item in top_k_items if item in items)
 
-        pop_share = pop_predictions / total_predictions if total_predictions > 0 else 0.0
+        denominator = len(predictions) * k
+        pop_share = pop_predictions / denominator if denominator else 0.0
+        tail_share = tail_predictions / denominator if denominator else 0.0
         metrics[f"pop_item_share@{k}"] = pop_share
-        metrics[f"unpop_item_share@{k}"] = 1.0 - pop_share if total_predictions > 0 else 0.0
+        metrics[f"unpop_item_share@{k}"] = tail_share
+        metrics[f"fair_0.8@{k}"] = tail_share
+        metrics[f"recommendation_fill_rate@{k}"] = total_predictions / denominator if denominator else 0.0
+        metrics[f"pop_interaction50_item_share@{k}"] = (
+            interaction50_predictions / denominator if denominator else 0.0
+        )
+        metrics[f"unpop_interaction50_item_share@{k}"] = (
+            (total_predictions - interaction50_predictions) / denominator if denominator else 0.0
+        )
         metrics[f"arp@{k}"] = arp_sum / total_predictions if total_predictions > 0 else 0.0
 
         for quantile, hit_count in quantile_hits.items():
             quantile_pct = int(round(quantile * 100))
-            share = hit_count / total_predictions if total_predictions > 0 else 0.0
+            share = hit_count / denominator if denominator else 0.0
             metrics[f"pop{quantile_pct}_item_share@{k}"] = share
             metrics[f"unpop{quantile_pct}_item_share@{k}"] = (
-                1.0 - share if total_predictions > 0 else 0.0
+                (total_predictions - hit_count) / denominator if denominator else 0.0
             )
 
         exposure_values = [exposure_counter.get(item, 0) for item in sorted(all_items)]
